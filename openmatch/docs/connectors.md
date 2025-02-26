@@ -39,6 +39,119 @@ class CustomConnector(Connector):
 
 ### 2. Built-in Connectors
 
+#### AWS Connector
+Connects to various AWS data services including S3, Redshift, and DynamoDB.
+
+```python
+from openmatch.connectors import AWSConnector
+
+# S3 Example
+s3_connector = AWSConnector(
+    service="s3",
+    region="us-west-2",
+    aws_access_key_id="your_access_key",
+    aws_secret_access_key="your_secret_key",
+    bucket="your-bucket"
+)
+
+# Read from S3
+records = s3_connector.read_records("path/to/data.csv")
+
+# Redshift Example
+redshift_connector = AWSConnector(
+    service="redshift",
+    region="us-west-2",
+    aws_access_key_id="your_access_key",
+    aws_secret_access_key="your_secret_key",
+    cluster_identifier="your-cluster",
+    database="your_db",
+    user="your_user",
+    password="your_password"
+)
+
+# Execute Redshift query
+records = redshift_connector.read_records(
+    "SELECT * FROM users WHERE status = %(status)s",
+    params={"status": "active"}
+)
+
+# DynamoDB Example
+dynamo_connector = AWSConnector(
+    service="dynamodb",
+    region="us-west-2",
+    aws_access_key_id="your_access_key",
+    aws_secret_access_key="your_secret_key",
+    table="your-table"
+)
+
+# Read from DynamoDB
+records = dynamo_connector.read_records(
+    "users",
+    params={"Key": {"id": "123"}}
+)
+```
+
+#### JDBC Connector
+Universal connector for any JDBC-compliant database.
+
+```python
+from openmatch.connectors import JDBCConnector
+
+connector = JDBCConnector(
+    jdbc_url="jdbc:mysql://localhost:3306/mydb",
+    driver_class="com.mysql.jdbc.Driver",
+    jar_path="/path/to/mysql-connector.jar",
+    username="user",
+    password="pass"
+)
+
+# Execute query
+records = connector.read_records(
+    "SELECT * FROM customers WHERE region = ?",
+    params={"region": "WEST"}
+)
+
+# Write records
+count = connector.write_records(
+    records=[{"id": "1", "name": "John"}],
+    target="customers"
+)
+```
+
+#### ODBC Connector
+Universal connector for any ODBC-compliant database.
+
+```python
+from openmatch.connectors import ODBCConnector
+
+# Using DSN
+connector = ODBCConnector(
+    dsn="MyDataSource",
+    username="user",
+    password="pass"
+)
+
+# Using connection string
+connector = ODBCConnector(
+    connection_string="Driver={SQL Server};Server=server_name;Database=db_name;UID=user;PWD=pass"
+)
+
+# Using individual parameters
+connector = ODBCConnector(
+    driver="SQL Server",
+    server="server_name",
+    database="db_name",
+    username="user",
+    password="pass"
+)
+
+# Execute query
+records = connector.read_records(
+    "SELECT * FROM orders WHERE status = ?",
+    params={"status": "pending"}
+)
+```
+
 #### Flat File Connector
 Handles CSV, Excel, XML, and JSON file formats with automatic type detection.
 
