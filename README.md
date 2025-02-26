@@ -56,7 +56,29 @@
   - Time-travel querying
   - Change reason documentation
 
-### 4. 🏗️ Enterprise Integration
+### 4. 🏛️ Data Model Management
+- 📊 **Entity Configuration**
+  - Business entity definition
+  - Field-level metadata
+  - Validation rules
+  - Custom attributes
+  - Entity relationships
+
+- 🔄 **Source Integration**
+  - Schema discovery
+  - Field mapping
+  - Data type conversion
+  - Transformation rules
+  - Loading configurations
+
+- 📐 **Physical Model Management**
+  - Automated table creation
+  - Schema evolution
+  - Index optimization
+  - Partitioning strategy
+  - Storage optimization
+
+### 5. 🏗️ Enterprise Integration
 - 🔌 **Connector Framework**
   - Native Databricks integration
   - Snowflake/Snowpark support
@@ -209,6 +231,179 @@ survivorship:
   phone:
     strategy: custom
     function: validate_and_format_phone
+```
+
+### Data Model Configuration
+```python
+from openmatch.model import (
+    DataModelConfig,
+    EntityConfig,
+    FieldConfig,
+    DataType,
+    RelationType,
+    PhysicalModelConfig,
+    SourceSystemConfig
+)
+
+# Define customer entity
+customer_entity = EntityConfig(
+    name="customer",
+    description="Customer master data",
+    fields=[
+        FieldConfig(
+            name="customer_id",
+            data_type=DataType.STRING,
+            description="Unique customer identifier",
+            required=True,
+            primary_key=True
+        ),
+        FieldConfig(
+            name="name",
+            data_type=DataType.STRING,
+            required=True,
+            validation_rules={
+                "min_length": {"type": "range", "min": 1},
+                "max_length": {"type": "range", "max": 100}
+            }
+        ),
+        FieldConfig(
+            name="email",
+            data_type=DataType.STRING,
+            validation_rules={
+                "format": {
+                    "type": "regex",
+                    "pattern": r"^[^@]+@[^@]+\.[^@]+$"
+                }
+            }
+        )
+    ]
+)
+
+# Define address entity with relationship
+address_entity = EntityConfig(
+    name="address",
+    description="Customer address data",
+    fields=[
+        FieldConfig(
+            name="address_id",
+            data_type=DataType.STRING,
+            required=True,
+            primary_key=True
+        ),
+        FieldConfig(
+            name="customer_id",
+            data_type=DataType.STRING,
+            required=True,
+            foreign_key="customer.customer_id"
+        ),
+        FieldConfig(
+            name="street",
+            data_type=DataType.STRING,
+            required=True
+        ),
+        FieldConfig(
+            name="city",
+            data_type=DataType.STRING,
+            required=True
+        )
+    ],
+    relationships=[
+        RelationshipConfig(
+            name="customer_address",
+            source_entity="address",
+            target_entity="customer",
+            relation_type=RelationType.MANY_TO_ONE,
+            source_field="customer_id",
+            target_field="customer_id"
+        )
+    ]
+)
+
+# Configure source systems
+source_systems = {
+    "CRM": SourceSystemConfig(
+        name="CRM",
+        type="database",
+        connection_details={
+            "connection_string": "postgresql://user:pass@localhost:5432/crm"
+        },
+        field_mappings={
+            "customer": {
+                "customer_id": "id",
+                "name": "full_name",
+                "email": "email_address"
+            }
+        }
+    ),
+    "ERP": SourceSystemConfig(
+        name="ERP",
+        type="database",
+        connection_details={
+            "connection_string": "postgresql://user:pass@localhost:5432/erp"
+        },
+        field_mappings={
+            "customer": {
+                "customer_id": "customer_number",
+                "name": "customer_name",
+                "email": "contact_email"
+            }
+        }
+    )
+}
+
+# Configure physical model
+physical_model = PhysicalModelConfig(
+    table_prefix="mdm_",
+    schema_name="master_data",
+    partition_strategy={
+        "customer": {"column": "created_at", "interval": "1 month"}
+    },
+    storage_options={
+        "tablespace": "mdm_space"
+    }
+)
+
+# Create data model configuration
+model_config = DataModelConfig(
+    entities={
+        "customer": customer_entity,
+        "address": address_entity
+    },
+    source_systems=source_systems,
+    physical_model=physical_model
+)
+
+# Initialize data model manager
+from openmatch.model import DataModelManager
+import sqlalchemy as sa
+
+engine = sa.create_engine("postgresql://user:pass@localhost:5432/mdm")
+manager = DataModelManager(model_config, engine)
+
+# Create physical tables
+manager.create_physical_model()
+
+# Discover source schema
+crm_schema = manager.discover_source_schema("CRM", "customers")
+print("CRM Schema:", crm_schema)
+
+# Map and validate data
+crm_data = {
+    "id": "C123",
+    "full_name": "Acme Corp",
+    "email_address": "contact@acme.com"
+}
+
+# Apply field mappings
+mapped_data = manager.apply_field_mappings("CRM", "customer", crm_data)
+print("Mapped Data:", mapped_data)
+
+# Validate data
+errors = manager.validate_entity_data("customer", mapped_data)
+if errors:
+    print("Validation Errors:", errors)
+else:
+    print("Data is valid")
 ```
 
 ## 📊 Performance & Scalability
