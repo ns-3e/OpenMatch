@@ -57,6 +57,26 @@ class NullHandling:
     null_equality_score: float = 0.0
     require_both_non_null: bool = True
     null_field_score: float = 0.0
+    
+    def __hash__(self):
+        """Make NullHandling hashable."""
+        return hash((
+            self.match_nulls,
+            self.null_equality_score,
+            self.require_both_non_null,
+            self.null_field_score
+        ))
+        
+    def __eq__(self, other):
+        """Define equality for NullHandling objects."""
+        if not isinstance(other, NullHandling):
+            return NotImplemented
+        return (
+            self.match_nulls == other.match_nulls and
+            self.null_equality_score == other.null_equality_score and
+            self.require_both_non_null == other.require_both_non_null and
+            self.null_field_score == other.null_field_score
+        )
 
 
 @dataclass
@@ -111,6 +131,37 @@ class FieldMatchConfig:
                 "method": "levenshtein",
                 "threshold": 0.8
             }
+            
+    def __hash__(self):
+        """Make FieldMatchConfig hashable by using immutable attributes."""
+        return hash((
+            self.match_type,
+            self.weight,
+            self.threshold,
+            hash(self.null_handling),
+            self.phonetic_algorithm,
+            self.date_format,
+            self.numeric_tolerance
+        ))
+        
+    def __eq__(self, other):
+        """Define equality for FieldMatchConfig objects."""
+        if not isinstance(other, FieldMatchConfig):
+            return NotImplemented
+        return (
+            self.match_type == other.match_type and
+            self.weight == other.weight and
+            self.threshold == other.threshold and
+            self.null_handling == other.null_handling and
+            self.fuzzy_params == other.fuzzy_params and
+            self.phonetic_algorithm == other.phonetic_algorithm and
+            self.date_format == other.date_format and
+            self.numeric_tolerance == other.numeric_tolerance and
+            self.conditional_rules == other.conditional_rules and
+            self.segment_config == other.segment_config and
+            self.custom_config == other.custom_config and
+            self.preprocessors == other.preprocessors
+        )
 
 
 @dataclass

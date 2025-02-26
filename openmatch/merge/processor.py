@@ -2,7 +2,7 @@
 Merge processor implementation for OpenMatch.
 """
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 import logging
 import uuid
 from datetime import datetime

@@ -11,7 +11,7 @@ from collections import defaultdict
 import numpy as np
 
 from openmatch.match.config import MatchConfig, BlockingConfig
-from openmatch.rules import MatchRules
+from openmatch.match.rules import MatchRules
 from openmatch.utils.logging import setup_logging
 
 

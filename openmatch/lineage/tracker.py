@@ -2,7 +2,7 @@
 Lineage tracker implementation for OpenMatch.
 """
 
-from typing import Dict, List, Optional, Set, Any, Tuple
+from typing import Dict, List, Optional, Set, Any, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 import logging

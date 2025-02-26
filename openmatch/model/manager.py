@@ -8,6 +8,7 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql import text
 
 from .config import (
     DataModelConfig,
@@ -110,27 +111,44 @@ class DataModelManager:
             self.logger.error(f"Failed to create table {table.name}: {str(e)}")
             raise
 
+    def _drop_table(self, table_name: str, schema: str) -> None:
+        """Drop a table if it exists.
+
+        Args:
+            table_name: Name of the table to drop
+            schema: Schema name
+        """
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {schema}.{table_name}"))
+                self.logger.info(f"Dropped table {schema}.{table_name}")
+        except SQLAlchemyError as e:
+            self.logger.error(f"Failed to drop table {schema}.{table_name}: {str(e)}")
+            raise
+
     def create_physical_model(self) -> None:
-        """Create all physical tables for the data model."""
+        """Create the physical tables in the database based on the data model configuration."""
         physical_model = self.config.to_physical_model()
-        schema = self.config.physical_model.schema_name
-        
+
         for entity_name, tables in physical_model.items():
             try:
+                # Drop existing tables first
+                self._drop_table(tables["master"]["name"], self.config.physical_model.schema_name)
+                self._drop_table(tables["history"]["name"], self.config.physical_model.schema_name)
+                self._drop_table(tables["xref"]["name"], self.config.physical_model.schema_name)
+
                 # Create master table
-                self._create_table(tables["master"], schema)
-                
+                self._create_table(tables["master"], self.config.physical_model.schema_name)
+
                 # Create history table
-                self._create_table(tables["history"], schema)
-                
+                self._create_table(tables["history"], self.config.physical_model.schema_name)
+
                 # Create cross-reference table
-                self._create_table(tables["xref"], schema)
-                
-                self.logger.info(f"Created all tables for entity {entity_name}")
+                self._create_table(tables["xref"], self.config.physical_model.schema_name)
+
+                self.logger.info(f"Created tables for entity {entity_name}")
             except Exception as e:
-                self.logger.error(
-                    f"Failed to create tables for entity {entity_name}: {str(e)}"
-                )
+                self.logger.error(f"Failed to create tables for entity {entity_name}: {str(e)}")
                 raise
 
     def discover_source_schema(

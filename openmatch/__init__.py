@@ -2,109 +2,129 @@
 OpenMatch - Enterprise-Grade Master Data Management Library
 """
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 import logging
+from dataclasses import dataclass
 
 from openmatch.match import MatchEngine, MatchConfig
 from openmatch.merge import MergeProcessor, MergeStrategy
 from openmatch.trust import TrustFramework, TrustConfig
 from openmatch.lineage import LineageTracker
 from openmatch.utils.logging import setup_logging
+from openmatch.config import (
+    SurvivorshipRules,
+    DataModelConfig,
+    ValidationRules,
+    PhysicalModelConfig
+)
 
 __version__ = "0.1.0"
 
+@dataclass
+class MDMResults:
+    """Results from MDM processing."""
+    total_records: int
+    match_groups_count: int
+    avg_group_size: float
+    golden_records: List[Dict[str, Any]]
+    review_required: List[Dict[str, Any]]
+    source_counts: Dict[str, int]
+    quality_metrics: Dict[str, float]
+    match_scores: List[float]
+    source_records: Dict[str, List[Dict[str, Any]]]
+
 class MDMPipeline:
-    """Main pipeline class for MDM processing."""
+    """Main pipeline for MDM processing."""
     
     def __init__(
         self,
-        trust_config: Optional[TrustConfig] = None,
-        match_config: Optional[MatchConfig] = None,
-        merge_strategy: Optional[MergeStrategy] = None,
-        enable_lineage: bool = True,
+        data_model: DataModelConfig,
+        trust_config: TrustConfig,
+        survivorship_rules: SurvivorshipRules,
+        match_config: MatchConfig,
+        db_config: Dict[str, str],
         logger: Optional[logging.Logger] = None
     ):
         """Initialize the MDM pipeline.
         
         Args:
-            trust_config: Configuration for trust scoring and survivorship
-            match_config: Configuration for match rules and thresholds
-            merge_strategy: Strategy for merging matched records
-            enable_lineage: Whether to track record lineage
+            data_model: Data model configuration
+            trust_config: Trust framework configuration
+            survivorship_rules: Survivorship rules
+            match_config: Match configuration
+            db_config: Database configuration
             logger: Optional logger instance
         """
-        self.logger = logger or setup_logging(__name__)
+        self.data_model = data_model
+        self.trust_config = trust_config
+        self.survivorship_rules = survivorship_rules
+        self.match_config = match_config
+        self.db_config = db_config
+        self.logger = logger or logging.getLogger(__name__)
         
         # Initialize components
         self.match_engine = MatchEngine(match_config)
-        self.merge_processor = MergeProcessor(merge_strategy)
+        self.merge_processor = MergeProcessor()
         self.trust_framework = TrustFramework(trust_config)
-        self.lineage_tracker = LineageTracker() if enable_lineage else None
+        self.lineage = LineageTracker()
         
-        self.logger.info("MDM Pipeline initialized")
-    
     def process_records(
         self,
-        records: List[Dict],
-        batch_size: int = 1000,
-        return_details: bool = False
-    ) -> Dict:
-        """Process a batch of records through the MDM pipeline.
+        records: List[Dict[str, Any]]
+    ) -> MDMResults:
+        """Process records through the MDM pipeline.
         
         Args:
-            records: List of record dictionaries to process
-            batch_size: Size of batches for processing
-            return_details: Whether to return detailed match/merge info
+            records: List of records to process
             
         Returns:
-            Dictionary containing:
-                - golden_records: List of golden records
-                - xrefs: Cross-reference mappings
-                - lineage: Record lineage info (if enabled)
-                - trust_scores: Trust scores for records
-                - details: Additional processing details (if return_details=True)
+            MDM processing results
         """
-        self.logger.info(f"Processing {len(records)} records")
-        
-        # Match similar records
-        matches = self.match_engine.find_matches(records, batch_size)
-        
-        # Score records for trust/survivorship
-        trust_scores = self.trust_framework.score_records(records)
-        
-        # Merge matched records
-        golden_records = self.merge_processor.merge_matches(
-            matches,
-            trust_scores=trust_scores
-        )
-        
-        # Track lineage if enabled
-        lineage = None
-        if self.lineage_tracker:
-            lineage = self.lineage_tracker.track_merge(
-                source_records=records,
-                golden_records=golden_records
-            )
-            
-        result = {
-            "golden_records": golden_records,
-            "xrefs": self.merge_processor.get_xrefs(),
-            "lineage": lineage,
-            "trust_scores": trust_scores
+        # Calculate trust scores
+        trust_scores = {
+            record["id"]: self.trust_framework.calculate_trust_scores(record)
+            for record in records
         }
         
-        if return_details:
-            result["details"] = {
-                "match_results": matches,
-                "merge_details": self.merge_processor.get_merge_details()
+        # Find matches
+        matches = self.match_engine.find_matches(records)
+        
+        # Merge matched records
+        golden_records = self.merge_processor.merge_matches(matches, trust_scores)
+        
+        # Track lineage
+        for golden_record in golden_records:
+            self.lineage.track_merge(
+                source_records=self.merge_processor.get_source_records(golden_record["id"]),
+                target_id=golden_record["id"],
+                user_id="system",
+                confidence_score=1.0,
+                details={}
+            )
+        
+        # Calculate metrics
+        source_counts = {}
+        for record in records:
+            source = record.get("source", "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+        
+        # Prepare results
+        results = MDMResults(
+            total_records=len(records),
+            match_groups_count=len(golden_records),
+            avg_group_size=len(records) / len(golden_records) if golden_records else 0,
+            golden_records=golden_records,
+            review_required=[],  # TODO: Implement review logic
+            source_counts=source_counts,
+            quality_metrics={},  # TODO: Implement quality metrics
+            match_scores=[score for _, _, score in matches],
+            source_records={
+                golden_id: list(self.merge_processor.get_source_records(golden_id))
+                for golden_id in [r["id"] for r in golden_records]
             }
-            
-        self.logger.info(
-            f"Processed {len(records)} records into {len(golden_records)} "
-            "golden records"
         )
         
-        return result
+        return results
     
     def get_golden_record(
         self,
@@ -122,8 +142,8 @@ class MDMPipeline:
         """
         golden_record = self.merge_processor.get_golden_record(record_id)
         
-        if golden_record and include_lineage and self.lineage_tracker:
-            golden_record["lineage"] = self.lineage_tracker.get_record_history(
+        if golden_record and include_lineage and self.lineage:
+            golden_record["lineage"] = self.lineage.get_record_history(
                 record_id
             )
             
