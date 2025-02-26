@@ -1,8 +1,8 @@
 # OpenMatch - Enterprise-Grade Master Data Management Library 🚀
 
-<p>
-<img src="openmatch/docs/OpenMatch-logo.png" alt="OpenMatch Logo" width="200" align="center">
-</p>  
+<p align="center" style="background-color: white;">
+<img src="openmatch/docs/OpenMatch-logo.png" alt="OpenMatch Logo" width="200">
+</p>
 
 [![Python](https://img.shields.io/badge/Python-3.7+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
