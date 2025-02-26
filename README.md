@@ -441,8 +441,8 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ### Development Setup
 ```bash
 # Clone repository
-git clone https://github.com/your-org/openmatch.git
-cd openmatch
+git clone https://github.com/ns-3e/OpenMatch.git
+cd OpenMatch
 
 # Create virtual environment
 python -m venv venv
@@ -455,27 +455,9 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
-## 📚 Documentation
-
-Comprehensive documentation is available at [https://openmatch.readthedocs.io/](https://openmatch.readthedocs.io/)
-
-- 📖 API Reference
-- 🎓 Tutorials
-- 📋 Best Practices
-- 🔍 Examples
-- 🛠️ Troubleshooting
-
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🌟 Support & Community
-
-- 💬 [GitHub Discussions](https://github.com/your-org/openmatch/discussions)
-- 📧 [Email Support](mailto:support@openmatch.org)
-- 🐦 [Twitter](https://twitter.com/openmatch)
-- 📱 [Slack Community](https://openmatch.slack.com)
-
 ---
 
 🚀 **Ready to master your data? Get started with OpenMatch today!**
