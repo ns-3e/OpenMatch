@@ -1,7 +1,7 @@
 # OpenMatch - Enterprise-Grade Master Data Management Library 🚀
 
 <p align="center" style="background: white;">
-<img src="openmatch/docs/assets/OpenMatch-logo.png" alt="OpenMatch Logo" width="200">
+<img src="openmatch/docs/assets/OpenMatch-logo.png" alt="OpenMatch Logo" width="400">
 </p>
 
 [![Python](https://img.shields.io/badge/Python-3.7+-blue.svg)](https://www.python.org/)
