@@ -39,6 +39,35 @@ class CustomConnector(Connector):
 
 ### 2. Built-in Connectors
 
+#### Flat File Connector
+Handles CSV, Excel, XML, and JSON file formats with automatic type detection.
+
+```python
+from openmatch.connectors import FlatFileConnector
+
+connector = FlatFileConnector(
+    base_path="/path/to/data",
+    file_type="auto",  # auto, csv, excel, xml, json
+    encoding="utf-8",
+    csv_separator=",",
+    excel_sheet="Sheet1"  # Optional
+)
+
+# Read from any supported format
+records = connector.read_records("customers.csv")
+records = connector.read_records("sales.xlsx")
+records = connector.read_records("products.xml")
+records = connector.read_records("orders.json")
+
+# Write records
+count = connector.write_records(
+    records=[{"id": "1", "name": "John"}],
+    target="output/customers.csv"
+)
+```
+
+For detailed documentation on the Flat File Connector, see [Flat File Connector Documentation](flat_file_connector.md).
+
 #### Snowflake Connector
 Connects to Snowflake Data Warehouse for data operations.
 
