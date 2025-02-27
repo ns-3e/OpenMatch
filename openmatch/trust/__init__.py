@@ -2,7 +2,7 @@
 OpenMatch Trust Module - Handles trust scoring and reliability calculations.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 from dataclasses import dataclass
 
 from .config import (
@@ -49,32 +49,52 @@ class TrustConfig:
     default_field_weight: float = 0.5
 
 class TrustFramework:
-    """Handles trust scoring and reliability calculations."""
+    """Framework for calculating trust scores."""
     
     def __init__(self, config: TrustConfig):
-        """Initialize trust framework.
-        
-        Args:
-            config: Trust framework configuration
-        """
         self.config = config
-    
-    def calculate_trust_scores(self, record: Dict[str, Any]) -> Dict[str, float]:
-        """Calculate trust scores for a record.
+
+    def calculate_trust_scores(self, records: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Calculate trust scores for a group of records.
         
         Args:
-            record: Record to calculate trust scores for
+            records: List of records to calculate trust scores for
             
         Returns:
-            Dictionary of field trust scores
+            Dictionary mapping record IDs to trust scores
         """
-        source = record.get("source", "unknown")
-        source_reliability = self.config.source_reliability.get(source, self.config.default_source_weight)
-        
         trust_scores = {}
-        for field, value in record.items():
-            if field in self.config.field_weights:
-                field_weight = self.config.field_weights.get(field, self.config.default_field_weight)
-                trust_scores[field] = source_reliability * field_weight
+        
+        for record in records:
+            source = record.get('source')
+            if not source:
+                continue
+                
+            # Get source reliability score
+            source_score = self.config.source_reliability.get(source, 0.5)
+            
+            # Calculate field-level scores
+            field_scores = {}
+            for field, weight in self.config.field_weights.items():
+                if field in record and record[field]:
+                    # Simple completeness check for now
+                    field_scores[field] = weight
+                else:
+                    field_scores[field] = 0.0
+            
+            # Calculate overall trust score
+            if field_scores:
+                total_weight = sum(self.config.field_weights.values())
+                weighted_sum = sum(
+                    score * self.config.field_weights[field]
+                    for field, score in field_scores.items()
+                )
+                field_score = weighted_sum / total_weight
+            else:
+                field_score = 0.0
+            
+            # Combine source and field scores
+            trust_scores[record['id']] = (source_score + field_score) / 2
         
         return trust_scores

@@ -39,57 +39,72 @@ __all__ = [
 ]
 
 class LineageTracker:
-    """Tracks record history and transformations."""
+    """Tracks record lineage and merge history."""
     
     def __init__(self):
-        self._history: Dict[str, List[Dict[str, Any]]] = {}
-    
-    def track_merge(
-        self,
-        source_records: List[str],
-        target_id: str,
-        user_id: str,
-        confidence_score: float,
-        details: Dict[str, Any]
-    ):
-        """Track a merge operation.
+        self.merge_history = []
+
+    def track_merge(self, source_records: List[Dict[str, Any]], golden_record: Dict[str, Any]) -> None:
+        """
+        Track a merge operation.
         
         Args:
-            source_records: List of source record IDs
-            target_id: ID of the resulting golden record
-            user_id: ID of the user who performed the merge
-            confidence_score: Confidence score of the merge
-            details: Additional merge details
+            source_records: List of source records that were merged
+            golden_record: Resulting golden record
         """
-        event = {
-            "type": "merge",
-            "timestamp": datetime.utcnow().isoformat(),
-            "source_records": source_records,
-            "target_id": target_id,
-            "user_id": user_id,
-            "confidence_score": confidence_score,
-            "details": details
+        merge_event = {
+            'timestamp': datetime.now().isoformat(),
+            'golden_record_id': golden_record['id'],
+            'source_record_ids': [r['id'] for r in source_records],
+            'source_systems': list(set(r.get('source') for r in source_records)),
+            'field_sources': self._track_field_sources(source_records, golden_record)
         }
         
-        if target_id not in self._history:
-            self._history[target_id] = []
-        self._history[target_id].append(event)
-    
+        self.merge_history.append(merge_event)
+
+    def _track_field_sources(
+        self,
+        source_records: List[Dict[str, Any]],
+        golden_record: Dict[str, Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Track which source record each field in the golden record came from."""
+        field_sources = {}
+        
+        for field, value in golden_record.items():
+            if field == 'id':  # Skip ID field
+                continue
+                
+            # Find which source record this value came from
+            for record in source_records:
+                if record.get(field) == value:
+                    field_sources[field] = {
+                        'source_record_id': record['id'],
+                        'source_system': record.get('source'),
+                        'original_value': value
+                    }
+                    break
+        
+        return field_sources
+
     def get_record_history(self, record_id: str) -> List[Dict[str, Any]]:
-        """Get the history of a record.
+        """
+        Get the merge history for a record.
         
         Args:
-            record_id: ID of the record
+            record_id: ID of the record to get history for
             
         Returns:
-            List of history events
+            List of merge events involving this record
         """
-        return self._history.get(record_id, [])
-    
-    def export(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Export all lineage data.
+        history = []
         
-        Returns:
-            Dictionary of record histories
-        """
-        return self._history
+        for event in self.merge_history:
+            if (record_id == event['golden_record_id'] or
+                record_id in event['source_record_ids']):
+                history.append(event)
+        
+        return history
+
+    def export(self):
+        """Export lineage data."""
+        return self.merge_history

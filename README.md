@@ -4,6 +4,8 @@
 <img src="openmatch/docs/assets/OpenMatch-logo.png" alt="OpenMatch Logo" width="400">
 </p>
 
+NOTE: This is a work in progress and not all functionality is available and/or stable yet.
+
 [![Python](https://img.shields.io/badge/Python-3.7+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Contributions](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg)](#-contributing)

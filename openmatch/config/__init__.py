@@ -68,6 +68,167 @@ class PhysicalModelConfig:
     xref_table_settings: Dict[str, Any]
 
 @dataclass
+class MetadataConfig:
+    """Configuration for metadata tables."""
+    schema_name: str
+    table_prefix: str
+    master_records_table: str = "master_records"
+    source_xref_table: str = "source_xref"
+    match_results_table: str = "match_results"
+    match_history_table: str = "match_history"
+    match_statistics_table: str = "match_statistics"
+    partitioning_settings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    indexing_settings: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    retention_settings: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+    def get_table_name(self, table_type: str) -> str:
+        """Get the full table name for a given type.
+        
+        Args:
+            table_type: Type of table (master_records, source_xref, match_results, etc.)
+            
+        Returns:
+            Full table name including schema and prefix
+        """
+        table_map = {
+            "master_records": self.master_records_table,
+            "source_xref": self.source_xref_table,
+            "match_results": self.match_results_table,
+            "match_history": self.match_history_table,
+            "match_statistics": self.match_statistics_table
+        }
+        
+        if table_type not in table_map:
+            raise ValueError(f"Invalid table type: {table_type}")
+            
+        return f"{self.schema_name}.{self.table_prefix}_{table_map[table_type]}"
+
+    def get_ddl_statements(self) -> List[str]:
+        """Generate DDL statements for creating metadata tables.
+        
+        Returns:
+            List of DDL statements
+        """
+        ddl = []
+        
+        # Create schema if not exists
+        ddl.append(f"CREATE SCHEMA IF NOT EXISTS {self.schema_name};")
+        
+        # Master records table
+        ddl.append(f"""
+            CREATE TABLE IF NOT EXISTS {self.get_table_name('master_records')} (
+                id SERIAL PRIMARY KEY,
+                entity_type VARCHAR(100) NOT NULL,
+                source_system VARCHAR(100) NOT NULL,
+                source_id VARCHAR(255) NOT NULL,
+                master_id VARCHAR(255) NOT NULL,
+                record_hash VARCHAR(64) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                UNIQUE(source_system, source_id)
+            );
+        """)
+        
+        # Source cross-reference table
+        ddl.append(f"""
+            CREATE TABLE IF NOT EXISTS {self.get_table_name('source_xref')} (
+                id SERIAL PRIMARY KEY,
+                source_system VARCHAR(100) NOT NULL,
+                source_id VARCHAR(255) NOT NULL,
+                target_system VARCHAR(100) NOT NULL,
+                target_id VARCHAR(255) NOT NULL,
+                match_score FLOAT NOT NULL,
+                match_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_system, source_id, target_system, target_id)
+            );
+        """)
+        
+        # Match results table
+        ddl.append(f"""
+            CREATE TABLE IF NOT EXISTS {self.get_table_name('match_results')} (
+                id SERIAL PRIMARY KEY,
+                source_id VARCHAR(255) NOT NULL,
+                target_id VARCHAR(255) NOT NULL,
+                match_score FLOAT NOT NULL,
+                match_type VARCHAR(50) NOT NULL,
+                match_details JSONB,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_id, target_id)
+            );
+        """)
+        
+        # Match history table
+        ddl.append(f"""
+            CREATE TABLE IF NOT EXISTS {self.get_table_name('match_history')} (
+                id SERIAL PRIMARY KEY,
+                source_id VARCHAR(255) NOT NULL,
+                target_id VARCHAR(255) NOT NULL,
+                match_score FLOAT NOT NULL,
+                match_type VARCHAR(50) NOT NULL,
+                match_details JSONB,
+                match_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                batch_id VARCHAR(255) NOT NULL
+            );
+        """)
+        
+        # Match statistics table
+        ddl.append(f"""
+            CREATE TABLE IF NOT EXISTS {self.get_table_name('match_statistics')} (
+                id SERIAL PRIMARY KEY,
+                batch_id VARCHAR(255) NOT NULL,
+                entity_type VARCHAR(100) NOT NULL,
+                source_system VARCHAR(100) NOT NULL,
+                total_records INTEGER NOT NULL,
+                matched_records INTEGER NOT NULL,
+                match_score_avg FLOAT NOT NULL,
+                processing_time FLOAT NOT NULL,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP NOT NULL,
+                UNIQUE(batch_id, entity_type, source_system)
+            );
+        """)
+        
+        # Add partitioning if configured
+        if self.partitioning_settings:
+            for table, settings in self.partitioning_settings.items():
+                ddl.extend(self._generate_partition_ddl(table, settings))
+                
+        # Add indexes if configured
+        if self.indexing_settings:
+            for table, settings in self.indexing_settings.items():
+                ddl.extend(self._generate_index_ddl(table, settings))
+                
+        return ddl
+
+    def _generate_partition_ddl(self, table: str, settings: Dict[str, Any]) -> List[str]:
+        """Generate DDL statements for table partitioning.
+        
+        Args:
+            table: Table name
+            settings: Partitioning settings
+            
+        Returns:
+            List of DDL statements
+        """
+        ddl = []
+        # Add partition-specific DDL based on settings
+        return ddl
+
+    def _generate_index_ddl(self, table: str, settings: Dict[str, Any]) -> List[str]:
+        """Generate DDL statements for indexes.
+        
+        Args:
+            table: Table name
+            settings: Index settings
+            
+        Returns:
+            List of DDL statements
+        """
+        ddl = []
+        # Add index-specific DDL based on settings
+        return ddl
+
+@dataclass
 class DataModelConfig:
     """Configuration for data model."""
     entity_type: str

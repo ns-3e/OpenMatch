@@ -3,9 +3,12 @@ Configuration classes for data model management.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, ClassVar
 from enum import Enum
 from datetime import datetime
+import os
+import yaml
+from pathlib import Path
 
 
 class DataType(Enum):
@@ -111,6 +114,124 @@ class DataModelConfig:
     source_systems: Dict[str, SourceSystemConfig]
     physical_model: PhysicalModelConfig
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    DEFAULT_CONFIG_PATHS: ClassVar[List[str]] = [
+        'openmatch_model.yaml',
+        'config/openmatch_model.yaml',
+        os.path.expanduser('~/.openmatch/model.yaml'),
+        '/etc/openmatch/model.yaml'
+    ]
+
+    @classmethod
+    def load(cls, config_path: Optional[str] = None) -> 'DataModelConfig':
+        """Load configuration from a YAML file.
+        
+        Args:
+            config_path: Optional path to configuration file. If not provided,
+                        will search in default locations.
+                        
+        Returns:
+            DataModelConfig instance
+            
+        Raises:
+            FileNotFoundError: If no configuration file is found
+            ValueError: If configuration is invalid
+        """
+        # Find configuration file
+        if config_path:
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(
+                    f"Configuration file not found: {config_path}"
+                )
+            paths = [config_path]
+        else:
+            paths = cls.DEFAULT_CONFIG_PATHS
+            
+        config_file = None
+        for path in paths:
+            if os.path.exists(path):
+                config_file = path
+                break
+                
+        if not config_file:
+            raise FileNotFoundError(
+                "No configuration file found. Please create one at one of: "
+                f"{', '.join(paths)}"
+            )
+            
+        # Load and parse configuration
+        with open(config_file, 'r') as f:
+            config_data = yaml.safe_load(f)
+            
+        # Convert configuration data to objects
+        entities = {
+            name: EntityConfig(
+                name=name,
+                description=entity.get('description'),
+                fields=[
+                    FieldConfig(
+                        name=field['name'],
+                        data_type=DataType(field['data_type']),
+                        description=field.get('description'),
+                        required=field.get('required', False),
+                        unique=field.get('unique', False),
+                        primary_key=field.get('primary_key', False),
+                        foreign_key=field.get('foreign_key'),
+                        default_value=field.get('default_value'),
+                        validation_rules=field.get('validation_rules', {}),
+                        metadata=field.get('metadata', {})
+                    )
+                    for field in entity.get('fields', [])
+                ],
+                relationships=[
+                    RelationshipConfig(
+                        name=rel['name'],
+                        source_entity=rel['source_entity'],
+                        target_entity=rel['target_entity'],
+                        relation_type=RelationType(rel['relation_type']),
+                        source_field=rel['source_field'],
+                        target_field=rel['target_field'],
+                        cascade_delete=rel.get('cascade_delete', False),
+                        metadata=rel.get('metadata', {})
+                    )
+                    for rel in entity.get('relationships', [])
+                ],
+                indexes=entity.get('indexes', []),
+                metadata=entity.get('metadata', {})
+            )
+            for name, entity in config_data.get('entities', {}).items()
+        }
+        
+        source_systems = {
+            name: SourceSystemConfig(
+                name=name,
+                type=source['type'],
+                connection_details=source['connection_details'],
+                schema_discovery=source.get('schema_discovery', {}),
+                field_mappings=source.get('field_mappings', {}),
+                transformation_rules=source.get('transformation_rules', {}),
+                load_config=source.get('load_config', {}),
+                metadata=source.get('metadata', {})
+            )
+            for name, source in config_data.get('source_systems', {}).items()
+        }
+        
+        physical_model = PhysicalModelConfig(
+            table_prefix=config_data.get('physical_model', {}).get('table_prefix', 'mdm_'),
+            schema_name=config_data.get('physical_model', {}).get('schema_name'),
+            partition_strategy=config_data.get('physical_model', {}).get('partition_strategy'),
+            storage_options=config_data.get('physical_model', {}).get('storage_options', {}),
+            index_options=config_data.get('physical_model', {}).get('index_options', {}),
+            history_table_suffix=config_data.get('physical_model', {}).get('history_table_suffix', '_history'),
+            xref_table_suffix=config_data.get('physical_model', {}).get('xref_table_suffix', '_xref')
+        )
+        
+        return cls(
+            entities=entities,
+            source_systems=source_systems,
+            physical_model=physical_model,
+            metadata=config_data.get('metadata', {})
+        )
 
     def validate(self) -> List[str]:
         """Validate the data model configuration."""

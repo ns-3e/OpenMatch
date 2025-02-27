@@ -32,50 +32,47 @@ class ResultsVisualizer:
         plt.rcParams["figure.figsize"] = self.config.figure_size
         sns.set_context("notebook", font_scale=self.config.font_scale)
     
-    def plot_match_distribution(self, results: Any) -> None:
-        """Plot distribution of match scores.
+    def plot_match_distribution(self, results: Dict[str, Any]) -> None:
+        """Plot distribution of match group sizes."""
+        group_sizes = [len(group) for group in results.source_records.values()]
         
-        Args:
-            results: MDM processing results
-        """
-        plt.figure()
-        sns.histplot(results.match_scores, bins=30)
-        plt.title("Distribution of Match Scores")
-        plt.xlabel("Match Score")
-        plt.ylabel("Count")
-        plt.show()
+        plt.figure(figsize=(10, 6))
+        sns.histplot(group_sizes, bins=20)
+        plt.title('Distribution of Match Group Sizes')
+        plt.xlabel('Group Size')
+        plt.ylabel('Count')
+        plt.savefig('match_distribution.png')
+        plt.close()
     
-    def plot_source_distribution(self, results: Any) -> None:
-        """Plot distribution of records by source.
+    def plot_source_distribution(self, results: Dict[str, Any]) -> None:
+        """Plot distribution of records by source."""
+        sources = list(results.source_counts.keys())
+        counts = list(results.source_counts.values())
         
-        Args:
-            results: MDM processing results
-        """
-        plt.figure()
-        source_counts = pd.Series(results.source_counts)
-        source_counts.plot(kind="bar")
-        plt.title("Record Distribution by Source")
-        plt.xlabel("Source")
-        plt.ylabel("Number of Records")
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=sources, y=counts)
+        plt.title('Record Distribution by Source')
+        plt.xlabel('Source')
+        plt.ylabel('Count')
         plt.xticks(rotation=45)
         plt.tight_layout()
-        plt.show()
+        plt.savefig('source_distribution.png')
+        plt.close()
     
-    def plot_data_quality_metrics(self, results: Any) -> None:
-        """Plot data quality metrics.
+    def plot_data_quality_metrics(self, results: Dict[str, Any]) -> None:
+        """Plot data quality metrics."""
+        metrics = list(results.quality_metrics.keys())
+        scores = list(results.quality_metrics.values())
         
-        Args:
-            results: MDM processing results
-        """
-        plt.figure()
-        metrics = pd.Series(results.quality_metrics)
-        metrics.plot(kind="bar")
-        plt.title("Data Quality Metrics")
-        plt.xlabel("Metric")
-        plt.ylabel("Score")
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=metrics, y=scores)
+        plt.title('Data Quality Metrics')
+        plt.xlabel('Metric')
+        plt.ylabel('Score')
         plt.xticks(rotation=45)
         plt.tight_layout()
-        plt.show()
+        plt.savefig('quality_metrics.png')
+        plt.close()
     
     def plot_match_graph(self, matches: List[tuple]) -> None:
         """Plot graph of record matches.
