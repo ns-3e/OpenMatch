@@ -12,19 +12,81 @@ import multiprocessing
 import time
 from datetime import datetime, timedelta
 from .engine import MatchEngine
+from .settings import DatabaseConfig, VectorBackend
 from ..connectors import SourceRecord, MatchResult, MasterRecord, MergeHistory
 
 class DatabaseOptimizer:
     """Handles database optimizations for large-scale matching."""
     
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, config: DatabaseConfig):
         self.session = session
-    
+        self.config = config
+        
+    def setup_vector_extension(self):
+        """Set up vector extension based on configured backend."""
+        if self.config.vector_backend == VectorBackend.PGVECTOR:
+            # Enable pgvector extension
+            self.session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            
+            # Create vector operators index
+            self.session.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {self.config.schema}.record_embeddings (
+                    record_id BIGINT PRIMARY KEY REFERENCES {self.config.schema}.source_records(id),
+                    embedding vector({self.config.vector_dimension}),
+                    model_id VARCHAR(100),
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            
+            # Create vector index based on configuration
+            if self.config.vector_index_type == 'ivfflat':
+                self.session.execute(text(f"""
+                    CREATE INDEX IF NOT EXISTS record_embeddings_vector_idx 
+                    ON {self.config.schema}.record_embeddings 
+                    USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = {self.config.vector_lists})
+                """))
+            elif self.config.vector_index_type == 'hnsw':
+                self.session.execute(text(f"""
+                    CREATE INDEX IF NOT EXISTS record_embeddings_vector_idx 
+                    ON {self.config.schema}.record_embeddings 
+                    USING hnsw (embedding vector_cosine_ops)
+                    WITH (m = 16, ef_construction = 64)
+                """))
+                
+            # Create function for vector similarity search
+            self.session.execute(text(f"""
+                CREATE OR REPLACE FUNCTION {self.config.schema}.find_similar_records(
+                    query_vector vector({self.config.vector_dimension}),
+                    similarity_threshold float,
+                    max_results integer
+                )
+                RETURNS TABLE (
+                    record_id bigint,
+                    similarity float
+                )
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    RETURN QUERY
+                    SELECT 
+                        e.record_id,
+                        1 - (e.embedding <=> query_vector) as similarity
+                    FROM {self.config.schema}.record_embeddings e
+                    WHERE 1 - (e.embedding <=> query_vector) >= similarity_threshold
+                    ORDER BY similarity DESC
+                    LIMIT max_results;
+                END;
+                $$;
+            """))
+            
+            self.session.commit()
+            
     def setup_job_tracking_tables(self):
         """Set up tables for job tracking and state management."""
-        self.session.execute(text("""
+        self.session.execute(text(f"""
             -- Job instances table
-            CREATE TABLE IF NOT EXISTS mdm.job_instances (
+            CREATE TABLE IF NOT EXISTS {self.config.schema}.job_instances (
                 job_id SERIAL PRIMARY KEY,
                 job_type VARCHAR(50) NOT NULL,  -- 'MATCH' or 'MERGE'
                 status VARCHAR(20) NOT NULL DEFAULT 'RUNNING',  -- 'RUNNING', 'COMPLETED', 'FAILED'
@@ -37,41 +99,42 @@ class DatabaseOptimizer:
             );
 
             -- Match state tracking table
-            CREATE TABLE IF NOT EXISTS mdm.record_states (
-                record_id BIGINT PRIMARY KEY REFERENCES mdm.source_records(id),
+            CREATE TABLE IF NOT EXISTS {self.config.schema}.record_states (
+                record_id BIGINT PRIMARY KEY REFERENCES {self.config.schema}.source_records(id),
                 match_state VARCHAR(20) NOT NULL DEFAULT 'UNMATCHED',  -- 'UNMATCHED', 'MATCHED', 'MERGED'
-                last_job_id BIGINT REFERENCES mdm.job_instances(job_id),
+                last_job_id BIGINT REFERENCES {self.config.schema}.job_instances(job_id),
                 last_matched_at TIMESTAMP,
                 last_merged_at TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Match pairs logging table
-            CREATE TABLE IF NOT EXISTS mdm.match_pairs (
+            -- Match pairs logging table with vector support
+            CREATE TABLE IF NOT EXISTS {self.config.schema}.match_pairs (
                 pair_id SERIAL PRIMARY KEY,
-                job_id BIGINT NOT NULL REFERENCES mdm.job_instances(job_id),
-                record_id_1 BIGINT NOT NULL REFERENCES mdm.source_records(id),
-                record_id_2 BIGINT NOT NULL REFERENCES mdm.source_records(id),
+                job_id BIGINT NOT NULL REFERENCES {self.config.schema}.job_instances(job_id),
+                record_id_1 BIGINT NOT NULL REFERENCES {self.config.schema}.source_records(id),
+                record_id_2 BIGINT NOT NULL REFERENCES {self.config.schema}.source_records(id),
                 match_model_id VARCHAR(100),  -- Reference to the model used
                 match_rule_id VARCHAR(100),   -- Reference to the rule that caused the match
                 match_score FLOAT NOT NULL,
+                vector_similarity FLOAT,  -- Store vector similarity score
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(record_id_1, record_id_2)  -- Prevent duplicate pairs
             );
 
             -- Create indexes for performance
             CREATE INDEX IF NOT EXISTS idx_job_instances_type_status 
-            ON mdm.job_instances (job_type, status, start_time DESC);
+            ON {self.config.schema}.job_instances (job_type, status, start_time DESC);
 
             CREATE INDEX IF NOT EXISTS idx_record_states_match_state 
-            ON mdm.record_states (match_state)
+            ON {self.config.schema}.record_states (match_state)
             INCLUDE (last_job_id, last_matched_at);
 
             CREATE INDEX IF NOT EXISTS idx_match_pairs_job 
-            ON mdm.match_pairs (job_id, match_score DESC);
+            ON {self.config.schema}.match_pairs (job_id, match_score DESC);
 
             CREATE INDEX IF NOT EXISTS idx_match_pairs_records 
-            ON mdm.match_pairs (record_id_1, record_id_2);
+            ON {self.config.schema}.match_pairs (record_id_1, record_id_2);
         """))
         self.session.commit()
     
@@ -241,6 +304,7 @@ class BatchProcessor:
         self,
         session: Session,
         match_engine: MatchEngine,
+        config: DatabaseConfig,
         batch_size: int = 10000,
         max_workers: int = None,
         use_processes: bool = False,
@@ -249,6 +313,7 @@ class BatchProcessor:
     ):
         self.session = session
         self.match_engine = match_engine
+        self.config = config
         self.batch_size = batch_size
         self.max_workers = max_workers or min(32, multiprocessing.cpu_count() * 2)
         self.use_processes = use_processes
@@ -257,148 +322,183 @@ class BatchProcessor:
         self.job_config = job_config or {}
         self.created_by = created_by
     
-    def _create_temp_tables(self):
-        """Create optimized temporary tables for batch processing."""
-        self.session.execute(text("""
-            -- Temporary table for match results with optimized structure
-            CREATE UNLOGGED TABLE IF NOT EXISTS temp_matches (
-                source_record_id BIGINT,
-                matched_record_id BIGINT,
-                match_score FLOAT,
-                match_type VARCHAR(20),
-                match_details JSONB,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (source_record_id, matched_record_id)
-            ) WITH (autovacuum_enabled = false);
-            
-            -- Create indexes optimized for our access patterns
-            CREATE INDEX IF NOT EXISTS temp_matches_score_idx 
-            ON temp_matches (match_score DESC, match_type)
-            WHERE match_score >= 0.7;
-            
-            -- Hash index for quick lookups
-            CREATE INDEX IF NOT EXISTS temp_matches_source_hash
-            ON temp_matches USING hash (source_record_id);
-            
-            -- BRIN index for time-based queries
-            CREATE INDEX IF NOT EXISTS temp_matches_time_brin
-            ON temp_matches USING brin (created_at);
-        """))
-    
-    def _get_blocking_query(self, blocking_keys: List[str]) -> str:
-        """Generate optimized SQL query for blocking with improved performance."""
-        key_conditions = []
-        for key in blocking_keys:
-            # Handle different field types with optimized expressions
-            key_conditions.append(f"""
-                CASE 
-                    WHEN jsonb_typeof(record_data->'{key}') = 'number' 
-                    THEN (record_data->'{key}')::numeric / 10 
-                    WHEN jsonb_typeof(record_data->'{key}') = 'string' 
-                    THEN LEFT(LOWER(record_data->>{key}), 3)
-                    ELSE NULL 
-                END
-            """)
-        
-        return f"""
-        WITH RECURSIVE 
-        blocked_records AS (
-            SELECT 
-                id,
-                record_data,
-                source_system,
-                CONCAT({', '.join(key_conditions)}) as block_key
-            FROM mdm.source_records
-            WHERE is_active = true
-            AND created_at > CURRENT_DATE - INTERVAL '1 year'
-        ),
-        block_stats AS (
-            SELECT 
-                block_key,
-                COUNT(*) as block_size
-            FROM blocked_records
-            GROUP BY block_key
-            HAVING COUNT(*) > 1
-            AND COUNT(*) <= :max_block_size
-        )
-        SELECT 
-            r1.id as id1,
-            r1.record_data as data1,
-            r1.source_system as system1,
-            r2.id as id2,
-            r2.record_data as data2,
-            r2.source_system as system2,
-            r1.block_key
-        FROM blocked_records r1
-        JOIN block_stats bs ON r1.block_key = bs.block_key
-        JOIN blocked_records r2 
-            ON r1.block_key = r2.block_key 
-            AND r1.id < r2.id
-            AND r1.source_system <= r2.source_system
-        WHERE r1.block_key IS NOT NULL
-        ORDER BY bs.block_size, r1.block_key
-        """
-    
-    def _process_record_batch(
-        self,
-        records: List[Tuple[int, int, Dict, Dict, str, str, str]]
-    ) -> List[Dict[str, Any]]:
-        """Process a batch of record pairs with optimized matching."""
-        matches = []
-        start_time = time.time()
-        
-        for id1, id2, data1, data2, system1, system2, block_key in records:
-            # Quick pre-check using exact field matches
-            if any(str(data1.get(field)) == str(data2.get(field))
-                   for field in self.match_engine.config.blocking.blocking_keys):
+    def store_embeddings(self, records: List[Dict[str, Any]], model_id: str):
+        """Store record embeddings in the vector database."""
+        embeddings = []
+        for record in records:
+            try:
+                # Compute embedding tensor
+                embedding = self.match_engine.compute_blocking_tensor(record)
                 
-                match_type, confidence = self.match_engine.match_records(
-                    data1, data2, fast_mode=True
+                # Convert to list for database storage
+                embeddings.append({
+                    'record_id': record['id'],
+                    'embedding': embedding.tolist(),
+                    'model_id': model_id
+                })
+            except Exception as e:
+                print(f"Warning: Failed to compute embedding for record {record.get('id')}: {str(e)}")
+        
+        if embeddings:
+            # Batch insert embeddings
+            self.session.execute(text(f"""
+                INSERT INTO {self.config.schema}.record_embeddings (
+                    record_id, embedding, model_id
+                )
+                SELECT 
+                    data->>'record_id',
+                    data->>'embedding',
+                    data->>'model_id'
+                FROM json_array_elements(:embeddings::json)
+                ON CONFLICT (record_id) 
+                DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    model_id = EXCLUDED.model_id,
+                    created_at = CURRENT_TIMESTAMP
+            """), {'embeddings': embeddings})
+            self.session.commit()
+    
+    def find_vector_matches(
+        self,
+        query_record: Dict[str, Any],
+        similarity_threshold: float = 0.8,
+        max_results: int = 100
+    ) -> List[Tuple[int, float]]:
+        """Find similar records using vector similarity search."""
+        try:
+            # Compute query embedding
+            query_embedding = self.match_engine.compute_blocking_tensor(query_record)
+            
+            # Use database vector search
+            results = self.session.execute(text(f"""
+                SELECT * FROM {self.config.schema}.find_similar_records(
+                    :query_vector::vector,
+                    :threshold,
+                    :max_results
+                )
+            """), {
+                'query_vector': query_embedding.tolist(),
+                'threshold': similarity_threshold,
+                'max_results': max_results
+            })
+            
+            return [(row.record_id, float(row.similarity)) for row in results]
+            
+        except Exception as e:
+            print(f"Warning: Vector search failed: {str(e)}")
+            return []
+    
+    def process_matches(self):
+        """Process matches using vector similarity search."""
+        if not self.job_id:
+            self.job_id = self._start_job()
+        
+        # Get unmatched records
+        query = text(f"""
+            SELECT id, record_data
+            FROM {self.config.schema}.source_records sr
+            WHERE NOT EXISTS (
+                SELECT 1 
+                FROM {self.config.schema}.record_states rs
+                WHERE rs.record_id = sr.id
+                AND rs.match_state IN ('MATCHED', 'MERGED')
+            )
+            ORDER BY id
+            LIMIT :batch_size
+        """)
+        
+        while True:
+            records = self.session.execute(query, {'batch_size': self.batch_size}).fetchall()
+            if not records:
+                break
+            
+            # Store embeddings for batch
+            self.store_embeddings(
+                [{'id': r.id, **r.record_data} for r in records],
+                self.match_engine.model_id
+            )
+            
+            # Process each record
+            for record in records:
+                # Find vector matches
+                vector_matches = self.find_vector_matches(
+                    record.record_data,
+                    similarity_threshold=self.config.match_threshold,
+                    max_results=100
                 )
                 
-                if match_type != MatchType.NO_MATCH:
-                    # Verify with full matching for high-confidence pairs
-                    if confidence >= 0.8:
-                        match_type, confidence = self.match_engine.match_records(
-                            data1, data2, fast_mode=False
-                        )
-                    
-                    if match_type != MatchType.NO_MATCH:
-                        matches.append({
-                            "source_record_id": id1,
-                            "matched_record_id": id2,
-                            "match_score": float(confidence),
-                            "match_type": match_type.value,
-                            "match_details": {
-                                "matched_fields": list(set(data1.keys()) & set(data2.keys())),
-                                "blocking_matched": True,
-                                "block_key": block_key,
-                                "source_systems": [system1, system2]
-                            }
-                        })
-        
-        # Update statistics
-        elapsed = time.time() - start_time
-        with ThreadPoolExecutor() as executor:
-            executor.submit(self._update_stats, len(records), len(matches), elapsed)
-        
-        return matches
-    
-    def _update_stats(self, records_processed: int, matches_found: int, elapsed: float):
-        """Update processing statistics."""
-        self.stats["processed"] += records_processed
-        self.stats["matches"] += matches_found
-        self.stats["last_batch_time"] = elapsed
-        
-        # Print progress every 100k records
-        if self.stats["processed"] % 100000 == 0:
-            total_elapsed = time.time() - self.stats["start_time"]
-            print(f"\nProgress Update:")
-            print(f"Processed: {self.stats['processed']:,} records")
-            print(f"Found: {self.stats['matches']:,} matches")
-            print(f"Rate: {self.stats['processed']/total_elapsed:,.0f} records/second")
-            print(f"Match Rate: {(self.stats['matches']/max(1, self.stats['processed'])*100):.2f}%")
-    
+                # Process matches
+                for matched_id, similarity in vector_matches:
+                    if matched_id != record.id:
+                        matched_record = self.session.execute(text(f"""
+                            SELECT record_data
+                            FROM {self.config.schema}.source_records
+                            WHERE id = :id
+                        """), {'id': matched_id}).first()
+                        
+                        if matched_record:
+                            # Apply match rules
+                            match_type, score, rule_id = self.match_engine.match_records(
+                                record.record_data,
+                                matched_record.record_data
+                            )
+                            
+                            if match_type != MatchType.NO_MATCH and score >= self.config.match_threshold:
+                                # Store match result
+                                self.session.execute(text(f"""
+                                    INSERT INTO {self.config.schema}.match_pairs (
+                                        job_id, record_id_1, record_id_2,
+                                        match_model_id, match_rule_id,
+                                        match_score, vector_similarity
+                                    ) VALUES (
+                                        :job_id, :id1, :id2,
+                                        :model_id, :rule_id,
+                                        :score, :similarity
+                                    )
+                                    ON CONFLICT (record_id_1, record_id_2) DO UPDATE SET
+                                        match_score = GREATEST(
+                                            {self.config.schema}.match_pairs.match_score,
+                                            EXCLUDED.match_score
+                                        ),
+                                        vector_similarity = EXCLUDED.vector_similarity,
+                                        updated_at = CURRENT_TIMESTAMP
+                                """), {
+                                    'job_id': self.job_id,
+                                    'id1': min(record.id, matched_id),
+                                    'id2': max(record.id, matched_id),
+                                    'model_id': self.match_engine.model_id,
+                                    'rule_id': rule_id,
+                                    'score': float(score),
+                                    'similarity': float(similarity)
+                                })
+                                
+                                # Update record states
+                                self.session.execute(text(f"""
+                                    INSERT INTO {self.config.schema}.record_states (
+                                        record_id, match_state, last_job_id, last_matched_at
+                                    ) VALUES 
+                                        (:id1, 'MATCHED', :job_id, CURRENT_TIMESTAMP),
+                                        (:id2, 'MATCHED', :job_id, CURRENT_TIMESTAMP)
+                                    ON CONFLICT (record_id) DO UPDATE SET
+                                        match_state = EXCLUDED.match_state,
+                                        last_job_id = EXCLUDED.last_job_id,
+                                        last_matched_at = EXCLUDED.last_matched_at
+                                """), {
+                                    'id1': record.id,
+                                    'id2': matched_id,
+                                    'job_id': self.job_id
+                                })
+                                
+                                self.stats["matches"] += 1
+                
+                self.stats["processed"] += 1
+                if self.stats["processed"] % 1000 == 0:
+                    self._update_stats(1000, self.stats["matches"], time.time() - self.stats["start_time"])
+                    self.session.commit()
+            
+            # Commit batch
+            self.session.commit()
+
     def _start_job(self, job_type: str = 'MATCH') -> int:
         """Start a new job instance and return its ID."""
         result = self.session.execute(text("""
@@ -441,350 +541,20 @@ class BatchProcessor:
         })
         self.session.commit()
 
-    def _update_record_states(self, record_pairs: List[Dict[str, Any]]):
-        """Update record states for matched pairs."""
-        if not record_pairs:
-            return
-
-        # Extract all record IDs involved in matches
-        record_ids = set()
-        for pair in record_pairs:
-            record_ids.add(pair['record_id_1'])
-            record_ids.add(pair['record_id_2'])
-
-        # Bulk upsert record states
-        self.session.execute(text("""
-            INSERT INTO mdm.record_states (
-                record_id, match_state, last_job_id, last_matched_at
-            )
-            SELECT 
-                id, 'MATCHED', :job_id, CURRENT_TIMESTAMP
-            FROM unnest(:record_ids::bigint[]) AS id
-            ON CONFLICT (record_id) DO UPDATE
-            SET match_state = 'MATCHED',
-                last_job_id = EXCLUDED.last_job_id,
-                last_matched_at = EXCLUDED.last_matched_at,
-                updated_at = CURRENT_TIMESTAMP
-        """), {
-            'job_id': self.job_id,
-            'record_ids': list(record_ids)
-        })
-
-    def _log_match_pairs(self, matches: List[Dict[str, Any]]):
-        """Log match pairs with their associated job, model, and rule IDs."""
-        if not matches:
-            return
-
-        self.session.execute(text("""
-            INSERT INTO mdm.match_pairs (
-                job_id, record_id_1, record_id_2, 
-                match_model_id, match_rule_id, match_score
-            )
-            SELECT 
-                :job_id,
-                (match.record_pair).record_id_1,
-                (match.record_pair).record_id_2,
-                match.model_id,
-                match.rule_id,
-                match.score
-            FROM unnest(:matches::jsonb[]) AS match(record_pair, model_id, rule_id, score)
-            ON CONFLICT (record_id_1, record_id_2) DO UPDATE
-            SET match_score = EXCLUDED.match_score,
-                match_model_id = EXCLUDED.match_model_id,
-                match_rule_id = EXCLUDED.match_rule_id,
-                created_at = CURRENT_TIMESTAMP
-        """), {
-            'job_id': self.job_id,
-            'matches': [
-                {
-                    'record_pair': {'record_id_1': m['record_id_1'], 'record_id_2': m['record_id_2']},
-                    'model_id': m.get('match_model_id'),
-                    'rule_id': m.get('match_rule_id'),
-                    'score': m['match_score']
-                }
-                for m in matches
-            ]
-        })
-
-    def process_matches(self):
-        """Enhanced process_matches with job tracking and state management."""
-        try:
-            self.job_id = self._start_job('MATCH')
-            
-            # Get unmatched or recently updated records for processing
-            query = text("""
-                SELECT r.* 
-                FROM mdm.source_records r
-                LEFT JOIN mdm.record_states s ON r.id = s.record_id
-                WHERE s.record_id IS NULL  -- New unmatched records
-                   OR (s.match_state = 'UNMATCHED')  -- Explicitly unmatched
-                   OR (r.updated_at > s.updated_at)  -- Records updated since last match
-                ORDER BY r.created_at DESC
-                LIMIT :batch_size
-            """)
-
-            while True:
-                records = self.session.execute(query, {'batch_size': self.batch_size}).fetchall()
-                if not records:
-                    break
-
-                # Process batch and get match results
-                match_results = self._process_record_batch(records)
-                
-                # Log match pairs and update record states
-                self._log_match_pairs(match_results)
-                self._update_record_states(match_results)
-                
-                # Update stats
-                self.stats['processed'] += len(records)
-                self.stats['matches'] += len(match_results)
-                
-                self.session.commit()
-
-            self._complete_job(True)
-            
-        except Exception as e:
-            self._complete_job(False)
-            raise e
-
-    def reset_matches(self, model_ids: List[str] = None, rule_ids: List[str] = None):
-        """Reset match pairs and record states based on specified criteria."""
-        try:
-            self.job_id = self._start_job('RESET')
-            
-            conditions = []
-            params = {}
-            
-            if model_ids:
-                conditions.append("match_model_id = ANY(:model_ids)")
-                params['model_ids'] = model_ids
-                
-            if rule_ids:
-                conditions.append("match_rule_id = ANY(:rule_ids)")
-                params['rule_ids'] = rule_ids
-                
-            where_clause = " OR ".join(conditions) if conditions else "TRUE"
-            
-            # Get affected record IDs
-            affected_records_query = f"""
-                SELECT DISTINCT record_id_1, record_id_2
-                FROM mdm.match_pairs
-                WHERE {where_clause}
-            """
-            
-            affected_records = self.session.execute(text(affected_records_query), params).fetchall()
-            record_ids = set()
-            for r1, r2 in affected_records:
-                record_ids.add(r1)
-                record_ids.add(r2)
-            
-            if record_ids:
-                # Reset record states
-                self.session.execute(text("""
-                    UPDATE mdm.record_states
-                    SET match_state = 'UNMATCHED',
-                        last_job_id = :job_id,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE record_id = ANY(:record_ids)
-                """), {
-                    'job_id': self.job_id,
-                    'record_ids': list(record_ids)
-                })
-                
-                # Delete match pairs
-                self.session.execute(text(f"""
-                    DELETE FROM mdm.match_pairs
-                    WHERE {where_clause}
-                """), params)
-                
-                self.session.commit()
-            
-            self._complete_job(True)
-            
-        except Exception as e:
-            self._complete_job(False)
-            raise e
-
-    def create_match_results(self):
-        """Create final match results with optimized bulk operations."""
-        print("\nCreating match results...")
-        self.session.execute(text("""
-            INSERT INTO mdm.match_results
-            (source_record_id, matched_record_id, match_score,
-             match_type, match_details, status, created_at)
-            SELECT 
-                source_record_id,
-                matched_record_id,
-                match_score,
-                match_type,
-                match_details,
-                CASE 
-                    WHEN match_score >= 0.8 THEN 'CONFIRMED'
-                    ELSE 'PENDING'
-                END as status,
-                created_at
-            FROM temp_matches
-            ON CONFLICT (source_record_id, matched_record_id) 
-            DO UPDATE SET
-                match_score = EXCLUDED.match_score,
-                match_type = EXCLUDED.match_type,
-                match_details = EXCLUDED.match_details || 
-                              jsonb_build_object('updated_at', CURRENT_TIMESTAMP),
-                status = EXCLUDED.status,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE match_results.match_score < EXCLUDED.match_score
-        """))
+    def _update_stats(self, records_processed: int, matches_found: int, elapsed: float):
+        """Update processing statistics."""
+        self.stats["processed"] += records_processed
+        self.stats["matches"] += matches_found
+        self.stats["last_batch_time"] = elapsed
         
-        self.session.commit()
-    
-    def create_master_records(self):
-        """Create master records using optimized clustering."""
-        print("\nCreating master records...")
-        self.session.execute(text("""
-            WITH RECURSIVE 
-            -- First, identify connected components (clusters)
-            match_clusters AS (
-                -- Start with confirmed matches
-                SELECT 
-                    source_record_id as record_id,
-                    source_record_id as cluster_id,
-                    ARRAY[source_record_id] as cluster_members,
-                    1 as depth
-                FROM mdm.match_results
-                WHERE status = 'CONFIRMED'
-                
-                UNION
-                
-                -- Recursively find connected records
-                SELECT 
-                    CASE
-                        WHEN m.source_record_id = c.record_id THEN m.matched_record_id
-                        ELSE m.source_record_id
-                    END as record_id,
-                    c.cluster_id,
-                    array_append(c.cluster_members, 
-                        CASE
-                            WHEN m.source_record_id = c.record_id THEN m.matched_record_id
-                            ELSE m.source_record_id
-                        END
-                    ) as cluster_members,
-                    c.depth + 1
-                FROM match_clusters c
-                JOIN mdm.match_results m ON 
-                    (m.source_record_id = c.record_id OR m.matched_record_id = c.record_id)
-                WHERE m.status = 'CONFIRMED'
-                AND c.depth < 10  -- Limit cluster depth to prevent cycles
-                AND NOT (
-                    CASE
-                        WHEN m.source_record_id = c.record_id THEN m.matched_record_id
-                        ELSE m.source_record_id
-                    END = ANY(c.cluster_members)
-                )
-            ),
-            -- Aggregate cluster information
-            cluster_stats AS (
-                SELECT DISTINCT ON (record_id)
-                    record_id,
-                    cluster_id,
-                    cluster_members,
-                    array_length(cluster_members, 1) as cluster_size
-                FROM match_clusters
-                ORDER BY record_id, depth DESC
-            ),
-            -- Calculate golden records
-            golden_records AS (
-                SELECT 
-                    cs.cluster_id,
-                    'person' as entity_type,
-                    jsonb_build_object(
-                        'sources', array_agg(DISTINCT s.source_system),
-                        'first_name', mode() WITHIN GROUP (ORDER BY s.record_data->>'first_name'),
-                        'last_name', mode() WITHIN GROUP (ORDER BY s.record_data->>'last_name'),
-                        'birth_date', mode() WITHIN GROUP (ORDER BY s.record_data->>'birth_date'),
-                        'ssn', mode() WITHIN GROUP (ORDER BY s.record_data->>'ssn'),
-                        'email', mode() WITHIN GROUP (ORDER BY s.record_data->>'email'),
-                        'phone', mode() WITHIN GROUP (ORDER BY s.record_data->>'phone'),
-                        'address', mode() WITHIN GROUP (ORDER BY s.record_data->>'address'),
-                        'updated_at', CURRENT_TIMESTAMP,
-                        'cluster_size', cs.cluster_size,
-                        'match_confidence', avg(mr.match_score)
-                    ) as golden_record,
-                    avg(mr.match_score) as confidence_score,
-                    cs.cluster_size as record_count,
-                    cs.cluster_members as source_record_ids
-                FROM cluster_stats cs
-                JOIN mdm.source_records s ON s.id = cs.record_id
-                JOIN mdm.match_results mr ON 
-                    (mr.source_record_id = cs.record_id OR mr.matched_record_id = cs.record_id)
-                WHERE mr.status = 'CONFIRMED'
-                GROUP BY cs.cluster_id, cs.cluster_size, cs.cluster_members
-            )
-            -- Insert golden records
-            INSERT INTO mdm.master_records (
-                entity_type,
-                golden_record,
-                confidence_score,
-                record_count,
-                source_record_ids,
-                created_at
-            )
-            SELECT 
-                entity_type,
-                golden_record,
-                confidence_score,
-                record_count,
-                source_record_ids,
-                CURRENT_TIMESTAMP
-            FROM golden_records
-            ON CONFLICT (source_record_ids) 
-            DO UPDATE SET
-                golden_record = 
-                    mdm.master_records.golden_record || 
-                    EXCLUDED.golden_record || 
-                    jsonb_build_object('updated_at', CURRENT_TIMESTAMP),
-                confidence_score = GREATEST(
-                    mdm.master_records.confidence_score,
-                    EXCLUDED.confidence_score
-                ),
-                record_count = EXCLUDED.record_count,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE mdm.master_records.confidence_score < EXCLUDED.confidence_score
-        """))
-        
-        self.session.commit()
-    
-    def create_merge_history(self):
-        """Create merge history with optimized operations."""
-        print("\nCreating merge history...")
-        self.session.execute(text("""
-            INSERT INTO mdm.merge_history (
-                master_record_id,
-                merged_record_ids,
-                merge_details,
-                operator,
-                created_at
-            )
-            SELECT 
-                m.id as master_record_id,
-                m.source_record_ids as merged_record_ids,
-                jsonb_build_object(
-                    'avg_match_score', m.confidence_score,
-                    'merged_at', CURRENT_TIMESTAMP,
-                    'merge_type', 'AUTOMATED',
-                    'cluster_size', m.record_count,
-                    'sources', m.golden_record->'sources'
-                ) as merge_details,
-                'system' as operator,
-                CURRENT_TIMESTAMP
-            FROM mdm.master_records m
-            WHERE NOT EXISTS (
-                SELECT 1 FROM mdm.merge_history h
-                WHERE h.master_record_id = m.id
-                AND h.merged_record_ids = m.source_record_ids
-            )
-        """))
-        
-        self.session.commit()
+        # Print progress every 100k records
+        if self.stats["processed"] % 100000 == 0:
+            total_elapsed = time.time() - self.stats["start_time"]
+            print(f"\nProgress Update:")
+            print(f"Processed: {self.stats['processed']:,} records")
+            print(f"Found: {self.stats['matches']:,} matches")
+            print(f"Rate: {self.stats['processed']/total_elapsed:,.0f} records/second")
+            print(f"Match Rate: {(self.stats['matches']/max(1, self.stats['processed'])*100):.2f}%")
 
 def process_matches(
     session: Session,

@@ -1,3 +1,0 @@
-"""
-OpenMatch MDM API package
-""" 

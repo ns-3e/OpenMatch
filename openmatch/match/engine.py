@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass
 from collections import defaultdict
 from .config import MatchConfig, MatchType
+from .settings import DatabaseConfig, VectorBackend
 from .rules import MatchRule
 from datetime import datetime
 from tqdm import tqdm
@@ -39,8 +40,9 @@ class LSHVector:
 class MatchEngine:
     """Core matching engine implementation with optimizations for large datasets."""
     
-    def __init__(self, config: MatchConfig):
+    def __init__(self, config: MatchConfig, db_config: DatabaseConfig):
         self.config = config
+        self.db_config = db_config
         self.rules = [MatchRule(rule_config) for rule_config in config.rules]
         self.memory_threshold = 0.90  # 90% memory usage threshold
         self.embedding_batch_size = 128  # Increased batch size
@@ -55,9 +57,7 @@ class MatchEngine:
         
         # Initialize components
         self._initialize_embedding_model()
-        if self.embedding_model is not None:  # Only initialize index if model loaded
-            self._initialize_vector_index()
-        
+    
     def _check_memory(self, force=False):
         """Check if memory usage is below threshold, with rate limiting."""
         current_time = time.time()
@@ -118,73 +118,6 @@ class MatchEngine:
         # Precompute embeddings
         for value in common_values:
             _ = self.compute_embedding(value)
-        
-    def _initialize_vector_index(self):
-        """Initialize FAISS index for vector similarity search with optimizations for large datasets."""
-        num_fuzzy_fields = sum(1 for rule in self.rules 
-                              for field in rule.config.fields 
-                              if field.match_type == MatchType.FUZZY)
-        embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
-        total_dim = embedding_dim * num_fuzzy_fields
-        
-        # Create an optimized index based on dataset size
-        estimated_vectors = self.config.expected_records or 10000  # Default estimate
-        
-        if estimated_vectors > 1000000:  # Extremely large dataset (>1M records)
-            # Use HNSW index for faster search with very large datasets
-            M = 16  # Number of connections per layer (higher = better recall, more memory)
-            ef_construction = 80  # Higher values create higher quality graphs (but slower construction)
-            
-            if self.config.use_gpu:
-                res = faiss.StandardGpuResources()
-                # Use scalar quantizer for compression
-                self.index = faiss.GpuIndexIVFScalarQuantizer(
-                    res, total_dim, min(4096, estimated_vectors // 1000), 
-                    faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_INNER_PRODUCT
-                )
-            else:
-                # For CPU, use HNSW which works well for large datasets
-                self.index = faiss.IndexHNSWFlat(total_dim, M, faiss.METRIC_INNER_PRODUCT)
-                self.index.hnsw.efConstruction = ef_construction
-                self.index.hnsw.efSearch = 128  # Higher values = higher recall (but slower search)
-        else:
-            # Medium-sized dataset, use IVF
-            nlist = max(4, min(int(math.sqrt(estimated_vectors)), 1024))  # Number of clusters, scaled with dataset size
-            quantizer = faiss.IndexFlatIP(total_dim)
-            
-            if self.config.use_gpu:
-                res = faiss.StandardGpuResources()
-                self.index = faiss.GpuIndexIVFFlat(res, total_dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            else:
-                self.index = faiss.IndexIVFFlat(quantizer, total_dim, nlist, faiss.METRIC_INNER_PRODUCT)
-                
-                # For large datasets, consider product quantization
-                if estimated_vectors > 100000:
-                    # Use product quantization for memory efficiency
-                    m = total_dim // 4  # Number of subquantizers (dimension must be multiple of m)
-                    m = min(m, 64)  # Cap at 64 subquantizers
-                    m = max(1, m)   # Ensure at least 1 subquantizer
-                    bits = 8        # Bits per subquantizer
-                    self.index = faiss.IndexIVFPQ(quantizer, total_dim, nlist, m, bits, faiss.METRIC_INNER_PRODUCT)
-        
-        # Set search parameters
-        if hasattr(self.index, 'nprobe'):
-            # For IVF indexes (including GPU ones)
-            self.index.nprobe = min(nlist, 32)  # Check more clusters for better recall
-        
-        # For training, we'll do this when data is available
-        self.index_trained = False
-    
-    def train_index(self, vectors: np.ndarray):
-        """Train the FAISS index with representative vectors."""
-        if not self.index_trained and hasattr(self.index, 'train'):
-            try:
-                print(f"Training index with {len(vectors)} vectors...")
-                self.index.train(vectors)
-                self.index_trained = True
-                print("Index trained successfully")
-            except Exception as e:
-                print(f"Warning: Failed to train index: {str(e)}")
     
     @lru_cache(maxsize=10000)  # Increased cache size
     def compute_embedding(self, text: str) -> np.ndarray:
@@ -431,7 +364,7 @@ class MatchEngine:
         k: int = 100,
         use_lsh: bool = True
     ) -> List[Tuple[int, float]]:
-        """Find candidate matches with hybrid approach (LSH + vector search)."""
+        """Find candidate matches using vector similarity search in the database."""
         self._check_memory()
         
         candidates = set()
@@ -445,18 +378,29 @@ class MatchEngine:
         if len(candidates) < k or not use_lsh:
             try:
                 query_tensor = self.compute_blocking_tensor(query_record)
-                search_k = min(k, self.index.ntotal) if hasattr(self.index, 'ntotal') else k
                 
-                if search_k > 0:  # Only search if we have records in the index
-                    distances, indices = self.index.search(
-                        np.array([query_tensor]), 
-                        search_k
-                    )
+                # Use database vector search
+                if self.db_config.vector_backend == VectorBackend.PGVECTOR:
+                    # Convert numpy array to list for database
+                    query_vector = query_tensor.tolist()
+                    
+                    # Use the database's vector search function
+                    results = self.session.execute(text(f"""
+                        SELECT * FROM {self.db_config.schema}.find_similar_records(
+                            :query_vector::vector,
+                            :threshold,
+                            :max_results
+                        )
+                    """), {
+                        'query_vector': query_vector,
+                        'threshold': 0.7,  # Minimum similarity threshold
+                        'max_results': k
+                    })
                     
                     # Add vector search results to candidates
-                    for idx, dist in zip(indices[0], distances[0]):
-                        if idx != -1:  # FAISS returns -1 for invalid indices
-                            candidates.add((int(idx), float(dist)))
+                    for row in results:
+                        candidates.add((int(row.record_id), float(row.similarity)))
+                        
             except Exception as e:
                 print(f"Warning: Vector search failed: {str(e)}")
         
@@ -466,7 +410,7 @@ class MatchEngine:
             # Convert any non-tuple candidates to tuples with default distance
             valid_results = [(c, 1.0) if not isinstance(c, tuple) else c for c in valid_results]
             
-        # Sort by distance (higher is better for inner product)
+        # Sort by similarity (higher is better)
         valid_results.sort(key=lambda x: x[1], reverse=True)
         
         # Limit to k results
