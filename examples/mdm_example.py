@@ -4,172 +4,243 @@ Example script demonstrating how to use OpenMatch for MDM operations with relati
 
 import os
 import sys
+import json
+import logging
 from pathlib import Path
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add the project root to Python path
 project_root = str(Path(__file__).parent.parent)
 sys.path.insert(0, project_root)
 
 from openmatch.match.engine import MatchEngine
-from openmatch.match.db_ops import DatabaseOptimizer, BatchProcessor
+from openmatch.match.config import (
+    MatchConfig,
+    MatchType,
+    MetadataConfig,
+    BlockingConfig,
+    MatchRuleConfig,
+    FieldConfig
+)
+from openmatch.match.settings import DatabaseConfig
+from openmatch.match.system_check import print_model_recommendations
 from openmatch.model.entity import EntityManager
 from openmatch.model.config import DataModelConfig
-from openmatch.etl.manager import SourceSystemManager
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-def create_db_connection(config):
-    """Create a database connection using the configuration."""
-    connection_string = (
-        f"postgresql://{config['USER']}:{config['PASSWORD']}"
-        f"@{config['HOST']}:{config['PORT']}/{config['NAME']}"
-    )
-    return create_engine(connection_string)
+from openmatch.manage import MDMManager
 
 def initialize_mdm():
     """Initialize the MDM system."""
+    logger.info("Starting MDM initialization...")
+    
     # Import settings
     from config.settings import (
         MDM_DB, 
         MATCH_SETTINGS, 
         VECTOR_SETTINGS, 
         MDM_MODEL,
-        SOURCE_SYSTEMS
-    )
-
-    # Create database connection
-    engine = create_db_connection(MDM_DB)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-
-    # Initialize entity manager with data model
-    entity_manager = EntityManager(session)
-    entity_manager.initialize_model(MDM_MODEL)
-
-    # Load source system data
-    source_system_manager = SourceSystemManager(
-        session=session,
-        entity_manager=entity_manager,
-        config=SOURCE_SYSTEMS
-    )
-    source_system_manager.sync_entities()
-
-
-    # Initialize match engine with relationship support
-    match_engine = MatchEngine(
-        session,
-        match_settings=MATCH_SETTINGS,
-        vector_settings=VECTOR_SETTINGS,
-        entity_manager=entity_manager
+        SOURCE_SYSTEMS,
+        MODEL_SETTINGS
     )
     
-    return session, match_engine, entity_manager
+    logger.debug("Loaded configuration settings")
 
-def process_matches(session, match_engine):
-    """Process matches in batch."""
-    processor = BatchProcessor(session, match_engine)
-    results = processor.process_matches()
-    return results
+    # Create database configuration
+    db_config = DatabaseConfig.from_dict(MDM_DB)
+    logger.debug("Created database configuration")
 
-def find_matches_for_record(match_engine, record_data):
-    """Find matches for a specific record with related entities."""
-    matches = match_engine.find_candidates(record_data)
-    return matches
-
-def main():
     # Initialize MDM system
-    session, match_engine, entity_manager = initialize_mdm()
+    mdm_manager = MDMManager(db_config)
+    mdm_manager.initialize_system(MDM_MODEL)
+    logger.info("MDM system initialized successfully!")
 
-    try:
-        # Example: Process all pending matches
-        print("Processing matches...")
-        results = process_matches(session, match_engine)
-        print(f"Processed {len(results)} potential matches")
+    # Initialize match engine with relationship support
+    logger.info("Initializing match engine...")
+    blocking_config = BlockingConfig(
+        blocking_keys=VECTOR_SETTINGS['BLOCKING_KEYS'],
+        block_size_limit=VECTOR_SETTINGS.get('BLOCK_SIZE_LIMIT', 1000),
+        vector_similarity_threshold=VECTOR_SETTINGS.get('SIMILARITY_THRESHOLD', 0.8)
+    )
+    
+    metadata_config = MetadataConfig(
+        schema=MDM_DB.get('SCHEMA', 'public')
+    )
+    
+    match_config = MatchConfig(
+        rules=MATCH_SETTINGS['RULES'],
+        blocking=blocking_config,
+        metadata=metadata_config,
+        use_gpu=MODEL_SETTINGS.get('USE_GPU', False)
+    )
+    
+    match_engine = MatchEngine(
+        config=match_config,
+        db_config=db_config
+    )
+    logger.debug("Match engine initialized")
+    
+    return mdm_manager, match_engine
 
-        # Example: Find matches for a sample record with related entities
-        sample_record = {
-            'person': {
+def load_sample_data(mdm_manager):
+    """Load sample data into the MDM system."""
+    logger.info("Loading sample data...")
+    
+    # Example records with relationships
+    sample_records = [
+        {
+            'id': 'PERSON001',
+            'entity_type': 'person',
+            'data': {
                 'first_name': 'John',
                 'last_name': 'Smith',
                 'email': 'john.smith@example.com',
-                'birth_date': '1990-01-01'
-            },
-            'addresses': [
-                {
-                    'address_type': 'HOME',
-                    'street_1': '123 Main St',
-                    'city': 'Boston',
-                    'state': 'MA',
-                    'postal_code': '02108',
-                    'country': 'USA'
-                }
-            ],
-            'phones': [
-                {
-                    'phone_type': 'MOBILE',
-                    'phone_number': '+1-617-555-0123',
-                    'country_code': 'US'
-                }
-            ]
+                'birth_date': '1990-01-01',
+                'addresses': [
+                    {
+                        'type': 'HOME',
+                        'street_1': '123 Main St',
+                        'city': 'Boston',
+                        'state': 'MA',
+                        'postal_code': '02108',
+                        'country': 'USA'
+                    }
+                ],
+                'phones': [
+                    {
+                        'type': 'MOBILE',
+                        'phone_number': '+1-617-555-0123',
+                        'country_code': 'US'
+                    }
+                ]
+            }
+        },
+        {
+            'id': 'PERSON002',
+            'entity_type': 'person',
+            'data': {
+                'first_name': 'Jane',
+                'last_name': 'Doe',
+                'email': 'jane.doe@example.com',
+                'birth_date': '1985-05-15',
+                'addresses': [
+                    {
+                        'type': 'HOME',
+                        'street_1': '456 Oak Ave',
+                        'city': 'Cambridge',
+                        'state': 'MA',
+                        'postal_code': '02139',
+                        'country': 'USA'
+                    }
+                ],
+                'phones': [
+                    {
+                        'type': 'MOBILE',
+                        'phone_number': '+1-617-555-0456',
+                        'country_code': 'US'
+                    }
+                ]
+            }
         }
-
-        print("\nFinding matches for sample record...")
-        matches = find_matches_for_record(match_engine, sample_record)
-        
-        print("\nMatch Results:")
-        for match_id, similarity, details in matches:
-            print(f"\nMatch ID: {match_id}")
-            print(f"Overall Similarity Score: {similarity:.2f}")
-            if details:
-                print("Match Details:")
-                print(f"  Person Match Score: {details['person_score']:.2f}")
-                if 'address_scores' in details:
-                    print("  Address Matches:")
-                    for addr_score in details['address_scores']:
-                        print(f"    - Score: {addr_score:.2f}")
-                if 'phone_scores' in details:
-                    print("  Phone Matches:")
-                    for phone_score in details['phone_scores']:
-                        print(f"    - Score: {phone_score:.2f}")
-
-    finally:
-        session.close()
-
-def example_source_system_sync():
-    """Example of synchronizing data from a source system."""
-    from config.settings import SOURCE_SYSTEMS
+    ]
     
-    # Get CRM system configuration
-    crm_config = SOURCE_SYSTEMS['crm_system']
-    
-    # Create source system connection
-    source_engine = create_db_connection(crm_config)
-    source_session = sessionmaker(bind=source_engine)()
+    # Load records into MDM system
+    mdm_manager.load_source_records(sample_records, source_system='EXAMPLE_SYSTEM')
+    logger.info(f"Loaded {len(sample_records)} sample records")
+
+def process_matches(match_engine, batch_size=100):
+    """Process matches in batch."""
+    logger.info("Processing batch of records...")
     
     try:
-        # Initialize the source system sync manager
-        sync_manager = SourceSystemManager(
-            source_session=source_session,
-            mdm_session=session,
-            entity_manager=entity_manager,
-            config=crm_config
-        )
-        
-        # Perform the sync
-        stats = sync_manager.sync_entities()
-        
-        print("\nSync Statistics:")
-        print(f"Total Records Processed: {stats['total_processed']}")
-        print(f"New Records: {stats['new_records']}")
-        print(f"Updated Records: {stats['updated_records']}")
-        print(f"Related Entities Synced:")
-        for entity_type, count in stats['related_entities'].items():
-            print(f"  - {entity_type}: {count}")
+        # Get unmatched records
+        records = match_engine.get_unmatched_records(limit=batch_size)
+        if not records:
+            logger.info("No unmatched records found")
+            return []
             
-    finally:
-        source_session.close()
+        logger.debug(f"Processing {len(records)} records")
+        results = match_engine.process_batch(records)
+        
+        # Log match results
+        for record_id, matches in results.items():
+            if matches:
+                logger.info(f"Found {len(matches)} matches for record {record_id}")
+                for match_id, score in matches:
+                    logger.debug(f"Match: {match_id} (score: {score:.2f})")
+            else:
+                logger.debug(f"No matches found for record {record_id}")
+                
+        return results
+        
+    except Exception as e:
+        logger.error(f"Error processing matches: {e}", exc_info=True)
+        raise
+
+def merge_records(match_engine, matches):
+    """Merge matched records."""
+    logger.info("Merging matched records...")
+    
+    try:
+        for record_id, record_matches in matches.items():
+            if not record_matches:
+                continue
+                
+            # Get the best match
+            best_match_id, best_score = record_matches[0]
+            
+            if best_score >= 0.9:  # High confidence match
+                logger.info(f"Merging record {record_id} with {best_match_id} (score: {best_score:.2f})")
+                match_engine.merge_records(record_id, best_match_id)
+            else:
+                logger.debug(f"Match score too low for automatic merge: {best_score:.2f}")
+                
+    except Exception as e:
+        logger.error(f"Error merging records: {e}", exc_info=True)
+        raise
+
+def main():
+    try:
+        logger.info("Starting MDM example...")
+        
+        # Show system recommendations
+        print("\n=== System Analysis and Model Recommendations ===")
+        print_model_recommendations()
+        print("\nPress Enter to continue with the recommended model, or Ctrl+C to exit...")
+        input()
+        
+        # Initialize MDM system
+        mdm_manager, match_engine = initialize_mdm()
+
+        try:
+            # Load sample data
+            load_sample_data(mdm_manager)
+
+            # Process matches
+            print("\nProcessing matches...")
+            matches = process_matches(match_engine)
+            
+            if matches:
+                # Merge records with high confidence matches
+                merge_records(match_engine, matches)
+                print(f"\nProcessed and merged {len(matches)} record sets")
+            else:
+                print("\nNo matches found in this batch")
+
+        finally:
+            mdm_manager.close()
+            
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Error in MDM example: {e}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    main()
-    # Uncomment to run source system sync example
-    # example_source_system_sync() 
+    main() 

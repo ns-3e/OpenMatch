@@ -19,6 +19,15 @@ from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+from .system_check import (
+    check_system_resources,
+    get_recommended_model,
+    validate_model_requirements,
+    print_model_recommendations
+)
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MemoryError(Exception):
     """Raised when memory usage exceeds threshold."""
@@ -38,11 +47,62 @@ class LSHVector:
         return isinstance(other, LSHVector) and self.signature == other.signature
 
 class MatchEngine:
-    """Core matching engine implementation with optimizations for large datasets."""
+    """Manages matching operations with relationship support."""
     
-    def __init__(self, config: MatchConfig, db_config: DatabaseConfig):
+    def __init__(
+        self,
+        config: MatchConfig,
+        db_config: DatabaseConfig,
+        force_model: Optional[str] = None
+    ):
+        """Initialize match engine with configuration.
+        
+        Args:
+            config: Match engine configuration
+            db_config: Database configuration
+            force_model: Optional model name to use, bypassing system checks
+        """
         self.config = config
         self.db_config = db_config
+        self.logger = logging.getLogger(__name__)
+        
+        # Check system resources and get recommended model
+        resources = check_system_resources()
+        if force_model:
+            if not validate_model_requirements(force_model):
+                self.logger.warning(
+                    f"System requirements not met for model {force_model}. "
+                    "Performance may be degraded."
+                )
+            model_name = force_model
+        else:
+            model_name, model_config = get_recommended_model(resources)
+            self.logger.info(
+                f"Selected model {model_name} based on system resources. "
+                f"Description: {model_config['description']}"
+            )
+            
+        try:
+            # Initialize embedding model with appropriate batch size
+            available_ram = resources.get('available_ram_gb', 4)
+            batch_size = min(32, max(1, int(available_ram / 2)))  # Adjust batch size based on RAM
+            
+            self.model = SentenceTransformer(
+                model_name,
+                device='cuda' if resources.get('gpu_available') else 'cpu'
+            )
+            self.model.max_seq_length = 128  # Limit sequence length for memory efficiency
+            self.batch_size = batch_size
+            
+            self.logger.info(
+                f"Initialized embedding model with batch_size={batch_size}, "
+                f"device={'cuda' if resources.get('gpu_available') else 'cpu'}"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize embedding model: {e}")
+            raise
+        
         self.rules = [MatchRule(rule_config) for rule_config in config.rules]
         self.memory_threshold = 0.90  # 90% memory usage threshold
         self.embedding_batch_size = 128  # Increased batch size

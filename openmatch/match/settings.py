@@ -5,6 +5,7 @@ All settings can be overridden by creating a local_settings.py file.
 import os
 from enum import Enum
 from typing import Dict, List
+from dataclasses import dataclass
 
 # Vector Backend Options
 class VectorBackend(Enum):
@@ -12,6 +13,46 @@ class VectorBackend(Enum):
     QDRANT = "qdrant"      # Qdrant vector database
     MILVUS = "milvus"      # Milvus vector database
     FAISS = "faiss"        # In-memory FAISS (fallback)
+
+@dataclass
+class DatabaseConfig:
+    """Database configuration."""
+    engine: str
+    host: str
+    port: int
+    name: str
+    user: str
+    password: str
+    schema: str = 'public'
+    min_connections: int = 5
+    max_connections: int = 20
+    timeout: int = 30
+    vector_backend: VectorBackend = VectorBackend.PGVECTOR
+    vector_dimension: int = 768
+    vector_index_type: str = 'ivfflat'
+    vector_lists: int = 100
+    vector_probes: int = 10
+
+    @classmethod
+    def from_dict(cls, config: Dict) -> 'DatabaseConfig':
+        """Create DatabaseConfig from dictionary."""
+        return cls(
+            engine=config.get('ENGINE', 'postgresql'),
+            host=config.get('HOST', 'localhost'),
+            port=config.get('PORT', 5432),
+            name=config.get('NAME', 'mdm'),
+            user=config.get('USER', 'postgres'),
+            password=config.get('PASSWORD', ''),
+            schema=config.get('SCHEMA', 'public'),
+            min_connections=config.get('MIN_CONNECTIONS', 5),
+            max_connections=config.get('MAX_CONNECTIONS', 20),
+            timeout=config.get('TIMEOUT', 30),
+            vector_backend=VectorBackend(config.get('VECTOR_BACKEND', 'pgvector')),
+            vector_dimension=config.get('VECTOR_DIMENSION', 768),
+            vector_index_type=config.get('VECTOR_INDEX_TYPE', 'ivfflat'),
+            vector_lists=config.get('VECTOR_LISTS', 100),
+            vector_probes=config.get('VECTOR_PROBES', 10)
+        )
 
 # Database Settings
 MDM_DB = {
