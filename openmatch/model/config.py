@@ -325,4 +325,17 @@ class DataModelConfig:
                 "xref": xref_table
             }
 
-        return physical_model 
+        return physical_model
+
+    def __post_init__(self):
+        """Validate configuration."""
+        if not self.entities:
+            raise ValueError("At least one entity must be defined")
+        
+        for entity, config in self.entities.items():
+            if not isinstance(config, dict):
+                raise ValueError(f"Entity {entity} configuration must be a dictionary")
+            if "fields" not in config:
+                raise ValueError(f"Entity {entity} must define fields")
+            if not isinstance(config["fields"], list):
+                raise ValueError(f"Entity {entity} fields must be a list") 

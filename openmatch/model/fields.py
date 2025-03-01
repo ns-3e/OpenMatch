@@ -1,5 +1,5 @@
 """
-Field definitions for OpenMatch models.
+Field classes for OpenMatch models.
 """
 
 from typing import Any, Dict, Optional, Type, List, Union
@@ -10,100 +10,118 @@ import numpy as np
 
 
 class Field:
-    """Base field class for model attributes."""
+    """Base class for model fields."""
     
     def __init__(
         self,
-        verbose_name: Optional[str] = None,
-        description: Optional[str] = None,
-        required: bool = True,
+        null: bool = False,
+        blank: bool = False,
+        default: Any = None,
         unique: bool = False,
         primary_key: bool = False,
-        default: Any = None,
-        choices: Optional[list] = None,
-        validators: Optional[list] = None,
-        **kwargs
+        help_text: str = "",
+        verbose_name: str = None
     ):
-        self.verbose_name = verbose_name
-        self.description = description
-        self.required = required
+        self.null = null
+        self.blank = blank
+        self.default = default
         self.unique = unique
         self.primary_key = primary_key
-        self.default = default
-        self.choices = choices
-        self.validators = validators or []
-        self.name = None  # Set by ModelBase during model creation
+        self.help_text = help_text
+        self.verbose_name = verbose_name
         
-    def contribute_to_class(self, cls, name):
-        """Hook for performing additional initialization when adding to class."""
+        self.name = None
+        self.model = None
+        
+    def contribute_to_class(self, cls: Type, name: str):
+        """Initialize field on model class."""
         self.name = name
-        setattr(cls, name, None)
+        self.model = cls
+        setattr(cls, name, self)
+        
+    def __get__(self, instance, owner):
+        """Get field value from instance."""
+        if instance is None:
+            return self
+        return instance.__dict__.get(self.name, self.default)
+        
+    def __set__(self, instance, value):
+        """Set field value on instance."""
+        instance.__dict__[self.name] = self.to_python(value)
+        
+    def to_python(self, value: Any) -> Any:
+        """Convert value to Python type."""
+        if value is None and self.null:
+            return None
+        return value
+        
+    def get_prep_value(self, value: Any) -> Any:
+        """Prepare value for database storage."""
+        return value
 
 
 class CharField(Field):
     """String field."""
     
-    def __init__(
-        self,
-        max_length: Optional[int] = None,
-        min_length: Optional[int] = None,
-        **kwargs
-    ):
+    def __init__(self, max_length: int = None, **kwargs):
         super().__init__(**kwargs)
         self.max_length = max_length
-        self.min_length = min_length
+        
+    def to_python(self, value: Any) -> Optional[str]:
+        if value is None and self.null:
+            return None
+        return str(value)
 
 
 class IntegerField(Field):
     """Integer field."""
     
-    def __init__(
-        self,
-        min_value: Optional[int] = None,
-        max_value: Optional[int] = None,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.min_value = min_value
-        self.max_value = max_value
+    def to_python(self, value: Any) -> Optional[int]:
+        if value is None and self.null:
+            return None
+        return int(value)
 
 
 class FloatField(Field):
     """Float field."""
     
-    def __init__(
-        self,
-        min_value: Optional[float] = None,
-        max_value: Optional[float] = None,
-        decimal_places: Optional[int] = None,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.min_value = min_value
-        self.max_value = max_value
-        self.decimal_places = decimal_places
+    def to_python(self, value: Any) -> Optional[float]:
+        if value is None and self.null:
+            return None
+        return float(value)
 
 
 class BooleanField(Field):
     """Boolean field."""
     
-    def __init__(self, **kwargs):
-        kwargs['required'] = kwargs.get('required', False)
-        super().__init__(**kwargs)
+    def to_python(self, value: Any) -> Optional[bool]:
+        if value is None and self.null:
+            return None
+        return bool(value)
 
 
 class DateTimeField(Field):
     """DateTime field."""
     
-    def __init__(
-        self,
-        auto_now: bool = False,
-        auto_now_add: bool = False,
-        **kwargs
-    ):
+    def __init__(self, auto_now: bool = False, auto_now_add: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.auto_now = auto_now
         self.auto_now_add = auto_now_add
+        
+    def to_python(self, value: Any) -> Optional[datetime]:
+        if value is None and self.null:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return datetime.fromisoformat(value)
+        raise ValueError(f"Cannot convert {value} to datetime")
+        
+    def __set__(self, instance, value):
+        """Set datetime value with auto_now/auto_now_add support."""
+        if self.auto_now or (self.auto_now_add and instance.__dict__.get(self.name) is None):
+            value = datetime.now()
+        super().__set__(instance, value)
 
 
 class JSONField(Field):

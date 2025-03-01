@@ -5,8 +5,11 @@ Base model classes for OpenMatch.
 from typing import Any, Dict, List, Optional, Type, ClassVar
 from dataclasses import dataclass, field
 import inspect
+import json
+from datetime import datetime
+from copy import deepcopy
 
-from .fields import Field
+from .fields import Field, CharField, DateTimeField, FloatField
 
 
 class ModelOptions:
@@ -82,8 +85,10 @@ class Model(metaclass=ModelBase):
     
     def __init__(self, **kwargs):
         """Initialize model instance with field values."""
+        self._data = {}
         for name, value in kwargs.items():
             setattr(self, name, value)
+            self._data[name] = value
             
     @classmethod
     def get_fields(cls) -> Dict[str, Field]:
@@ -99,20 +104,60 @@ class Model(metaclass=ModelBase):
     def get_meta(cls) -> ModelOptions:
         """Get model metadata options."""
         return cls._meta
-        
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert model instance to dictionary."""
-        data = {}
-        for name, field in self.get_fields().items():
-            value = getattr(self, name, None)
-            if value is not None:
-                data[name] = value
-        return data
-        
+        return self._data.copy()
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Model':
         """Create model instance from dictionary."""
         return cls(**data)
+
+    def to_json(self) -> str:
+        """Convert model instance to JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'Model':
+        """Create model instance from JSON string."""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare model instances for equality."""
+        if not isinstance(other, self.__class__):
+            return False
+        return self._data == other._data
+
+    def __repr__(self) -> str:
+        """Get string representation of model instance."""
+        attrs = [f"{k}={v!r}" for k, v in self._data.items()]
+        return f"{self.__class__.__name__}({', '.join(attrs)})"
+
+    def copy(self) -> 'Model':
+        """Create a deep copy of the model instance."""
+        return self.__class__(**deepcopy(self._data))
+
+    def update(self, data: Dict[str, Any]) -> None:
+        """Update model instance with new data."""
+        for key, value in data.items():
+            if key in self._fields:
+                setattr(self, key, value)
+                self._data[key] = value
+
+    @classmethod
+    def validate(cls, data: Dict[str, Any]) -> Optional[str]:
+        """Validate data against model fields."""
+        for field_name, field in cls._fields.items():
+            if not field.null and field_name not in data:
+                return f"Field '{field_name}' is required"
+            if field_name in data:
+                try:
+                    field.validate(data[field_name])
+                except ValueError as e:
+                    return str(e)
+        return None
 
 
 class HistoryModel(Model):

@@ -15,97 +15,70 @@ NOTE: This is a work in progress and not all functionality is available and/or s
 
 ## 🎯 Core Capabilities
 
-### 1. 🔄 Match & Merge Processing
-- ⚡ **Intelligent Matching Engine**
-  - Vector embeddings with FAISS for fast approximate matching
-  - Configurable matching rules and thresholds
+### 1. 🔄 Match Engine (`openmatch.match`)
+- ⚡ **Advanced Matching Engine**
+  - Configurable blocking strategies for performance optimization
   - Multi-attribute fuzzy matching with weighted scoring
-  - Phonetic matching (Soundex, Metaphone) support
-  - Address standardization and geocoding
+  - Incremental matching support
+  - Match result persistence and metadata tracking
+  - Comprehensive match statistics and performance metrics
+  - Caching support for improved performance
 
-- 🎯 **Advanced Merge Strategies**
-  - Rule-based attribute-level merging
-  - Configurable merge precedence rules
-  - Conflict resolution workflows
-  - Bulk merge operations with rollback support
-  - Preview merges before commitment
+### 2. 🎯 Merge Processing (`openmatch.merge`)
+- 🔄 **Intelligent Merge Processing**
+  - Flexible merge strategy framework
+  - Golden record generation and management
+  - Cross-reference (xref) tracking
+  - Source record lineage
+  - Merge operation rollback support
+  - Detailed merge audit trails
 
-### 2. 🏆 Trust & Survivorship
-- 📊 **Data Quality Scoring**
-  - Source system reliability ratings
-  - Completeness and accuracy metrics
-  - Time-based freshness scoring
-  - Format validation and standardization
+### 3. 📊 Data Model Management (`openmatch.model`)
+- 🏗️ **Robust Model Framework**
+  - Entity and field configuration
+  - Physical model generation
+  - Schema validation
+  - Source system integration
+  - Field mapping and transformation
+  - Custom validation rules
 
-- 🎖️ **Survivorship Rules Engine**
-  - Configurable golden record creation
-  - Multi-domain survivorship rules
-  - Attribute-level survivorship
-  - Custom survivorship functions
-  - Machine learning-based attribute selection
+### 4. 📜 Lineage Tracking (`openmatch.lineage`)
+- 🔍 **Comprehensive Lineage**
+  - Cross-reference management
+  - Change history tracking
+  - Source system mapping
+  - Temporal data support
+  - Full audit capabilities
 
-### 3. 📜 Record History & Lineage
-- 🔍 **Cross-Reference Management**
-  - Bidirectional xref tracking
-  - Source system ID mapping
-  - Temporal xref validity
-  - Relationship type classification
+### 5. 🔌 Enterprise Connectors (`openmatch.connectors`)
+- 🌐 **Rich Connector Framework**
+  - AWS integration
+  - Azure support
+  - Databricks connectivity
+  - JDBC/ODBC support
+  - REST API integration
+  - Snowflake native support
+  - Flat file processing
 
-- 📝 **Change Data Capture**
-  - Full audit trail of all changes
-  - Before/after value tracking
-  - User and system attribution
-  - Time-travel querying
-  - Change reason documentation
+### 6. ⚙️ Management Tools (`openmatch.management`)
+- 🛠️ **Administrative Capabilities**
+  - Command-line interface
+  - Configuration management
+  - Deployment utilities
+  - Monitoring tools
 
-### 4. 🏛️ Data Model Management
-- 📊 **Entity Configuration**
-  - Business entity definition
-  - Field-level metadata
-  - Validation rules
-  - Custom attributes
-  - Entity relationships
-
-- 🔄 **Source Integration**
-  - Schema discovery
-  - Field mapping
-  - Data type conversion
-  - Transformation rules
-  - Loading configurations
-
-- 📐 **Physical Model Management**
-  - Automated table creation
-  - Schema evolution
-  - Index optimization
-  - Partitioning strategy
-  - Storage optimization
-
-### 5. 🏗️ Enterprise Integration
-- 🔌 **Connector Framework**
-  - Native Databricks integration
-  - Snowflake/Snowpark support
-  - Azure Synapse compatibility
-  - REST API endpoints
-  - Batch and real-time processing
-
-- 🔐 **Governance & Security**
-  - Role-based access control
-  - Data masking and encryption
-  - Compliance audit logging
-  - Data retention policies
-  - GDPR/CCPA support
-
----
+### 7. 🛡️ Trust Framework (`openmatch.trust`)
+- ✅ **Data Quality Management**
+  - Configurable trust rules
+  - Scoring framework
+  - Quality metrics
+  - Trust-based survivorship
+  - Framework configuration
 
 ## 📦 Installation
 
 ```bash
 pip install openmatch
-
-# Optional features
-pip install openmatch[all]  # All features
-pip install openmatch[cloud]  # Cloud integrations
-pip install openmatch[ml]  # Machine learning extensions
 ```
 
 ## 🚀 Quick Start
@@ -161,260 +134,13 @@ print("Lineage:", result.lineage)
 print("Trust Scores:", result.trust_scores)
 ```
 
-## ⚙️ Core Components
-
-### 1. Match Engine
-```python
-from openmatch.match import MatchConfig, MatchEngine
-
-match_config = MatchConfig(
-    blocking_keys=["zip_code", "name_prefix"],
-    comparison_fields=[
-        ("name", "fuzzy", 0.8),
-        ("address", "address_similarity", 0.7),
-        ("phone", "exact", 1.0)
-    ],
-    min_overall_score=0.85
-)
-```
-
-### 2. Trust Framework
-```python
-from openmatch.trust import TrustFramework
-
-trust_rules = {
-    "completeness_weight": 0.3,
-    "timeliness_weight": 0.4,
-    "source_weight": 0.3
-}
-
-trust_engine = TrustFramework(trust_rules)
-```
-
-### 3. Lineage Tracking
-```python
-from openmatch.lineage import LineageTracker
-
-lineage = LineageTracker()
-lineage.track_merge(source_records, golden_record)
-lineage.get_record_history("GOLDEN_001")
-```
-
-## 🔧 Advanced Configuration
-
-### Match Rules
-```yaml
-match_rules:
-  - name:
-      algorithm: hybrid
-      weights:
-        exact: 0.3
-        fuzzy: 0.5
-        phonetic: 0.2
-      threshold: 0.85
-  
-  - address:
-      algorithm: address
-      parse_components: true
-      threshold: 0.75
-```
-
-### Survivorship Rules
-```yaml
-survivorship:
-  name:
-    strategy: trusted_source
-    source_priority: [CRM, ERP, LEGACY]
-    
-  address:
-    strategy: most_recent
-    timestamp_field: last_updated
-    
-  phone:
-    strategy: custom
-    function: validate_and_format_phone
-```
-
-### Data Model Configuration
-```python
-from openmatch.model import (
-    DataModelConfig,
-    EntityConfig,
-    FieldConfig,
-    DataType,
-    RelationType,
-    PhysicalModelConfig,
-    SourceSystemConfig
-)
-
-# Define customer entity
-customer_entity = EntityConfig(
-    name="customer",
-    description="Customer master data",
-    fields=[
-        FieldConfig(
-            name="customer_id",
-            data_type=DataType.STRING,
-            description="Unique customer identifier",
-            required=True,
-            primary_key=True
-        ),
-        FieldConfig(
-            name="name",
-            data_type=DataType.STRING,
-            required=True,
-            validation_rules={
-                "min_length": {"type": "range", "min": 1},
-                "max_length": {"type": "range", "max": 100}
-            }
-        ),
-        FieldConfig(
-            name="email",
-            data_type=DataType.STRING,
-            validation_rules={
-                "format": {
-                    "type": "regex",
-                    "pattern": r"^[^@]+@[^@]+\.[^@]+$"
-                }
-            }
-        )
-    ]
-)
-
-# Define address entity with relationship
-address_entity = EntityConfig(
-    name="address",
-    description="Customer address data",
-    fields=[
-        FieldConfig(
-            name="address_id",
-            data_type=DataType.STRING,
-            required=True,
-            primary_key=True
-        ),
-        FieldConfig(
-            name="customer_id",
-            data_type=DataType.STRING,
-            required=True,
-            foreign_key="customer.customer_id"
-        ),
-        FieldConfig(
-            name="street",
-            data_type=DataType.STRING,
-            required=True
-        ),
-        FieldConfig(
-            name="city",
-            data_type=DataType.STRING,
-            required=True
-        )
-    ],
-    relationships=[
-        RelationshipConfig(
-            name="customer_address",
-            source_entity="address",
-            target_entity="customer",
-            relation_type=RelationType.MANY_TO_ONE,
-            source_field="customer_id",
-            target_field="customer_id"
-        )
-    ]
-)
-
-# Configure source systems
-source_systems = {
-    "CRM": SourceSystemConfig(
-        name="CRM",
-        type="database",
-        connection_details={
-            "connection_string": "postgresql://user:pass@localhost:5432/crm"
-        },
-        field_mappings={
-            "customer": {
-                "customer_id": "id",
-                "name": "full_name",
-                "email": "email_address"
-            }
-        }
-    ),
-    "ERP": SourceSystemConfig(
-        name="ERP",
-        type="database",
-        connection_details={
-            "connection_string": "postgresql://user:pass@localhost:5432/erp"
-        },
-        field_mappings={
-            "customer": {
-                "customer_id": "customer_number",
-                "name": "customer_name",
-                "email": "contact_email"
-            }
-        }
-    )
-}
-
-# Configure physical model
-physical_model = PhysicalModelConfig(
-    table_prefix="mdm_",
-    schema_name="master_data",
-    partition_strategy={
-        "customer": {"column": "created_at", "interval": "1 month"}
-    },
-    storage_options={
-        "tablespace": "mdm_space"
-    }
-)
-
-# Create data model configuration
-model_config = DataModelConfig(
-    entities={
-        "customer": customer_entity,
-        "address": address_entity
-    },
-    source_systems=source_systems,
-    physical_model=physical_model
-)
-
-# Initialize data model manager
-from openmatch.model import DataModelManager
-import sqlalchemy as sa
-
-engine = sa.create_engine("postgresql://user:pass@localhost:5432/mdm")
-manager = DataModelManager(model_config, engine)
-
-# Create physical tables
-manager.create_physical_model()
-
-# Discover source schema
-crm_schema = manager.discover_source_schema("CRM", "customers")
-print("CRM Schema:", crm_schema)
-
-# Map and validate data
-crm_data = {
-    "id": "C123",
-    "full_name": "Acme Corp",
-    "email_address": "contact@acme.com"
-}
-
-# Apply field mappings
-mapped_data = manager.apply_field_mappings("CRM", "customer", crm_data)
-print("Mapped Data:", mapped_data)
-
-# Validate data
-errors = manager.validate_entity_data("customer", mapped_data)
-if errors:
-    print("Validation Errors:", errors)
-else:
-    print("Data is valid")
-```
-
 ## 📊 Performance & Scalability
 
-- 🚀 Processes millions of records per hour
-- 📈 Linear scaling with data volume
-- 🌐 Distributed processing support
-- 💾 Efficient memory management
-- ⚡ Incremental processing capability
+- 🚀 Optimized blocking strategies for efficient matching
+- 📈 Configurable caching for improved performance
+- 🌐 Support for incremental processing
+- 💾 Efficient metadata management
+- ⚡ Comprehensive performance metrics
 
 ## 🗺️ Roadmap
 
@@ -460,6 +186,7 @@ pytest tests/
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
 ---
 
 🚀 **Ready to master your data? Get started with OpenMatch today!**

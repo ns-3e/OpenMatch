@@ -1,5 +1,5 @@
 """
-Data model management implementation.
+Data model manager implementation.
 """
 
 from typing import Dict, List, Optional, Any, Union
@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql import text
+import json
 
 from .config import (
     DataModelConfig,
@@ -20,29 +21,119 @@ from .config import (
 
 
 class DataModelManager:
-    """Manager for data model operations."""
-
-    def __init__(
-        self,
-        config: DataModelConfig,
-        engine: sa.Engine,
-        logger: Optional[logging.Logger] = None
-    ):
-        """Initialize data model manager.
+    """Manages data model and physical tables."""
+    
+    def __init__(self, data_model: DataModelConfig, db_engine: sa.engine.Engine):
+        """Initialize manager with data model configuration."""
+        self.data_model = data_model
+        self.engine = db_engine
+        self.logger = logging.getLogger(__name__)
+        
+    def create_physical_model(self):
+        """Create physical tables."""
+        try:
+            # Create schema if not exists
+            with self.engine.begin() as conn:
+                conn.execute(text("CREATE SCHEMA IF NOT EXISTS mdm"))
+                
+            metadata = sa.MetaData(schema='mdm')
+            
+            # Create golden records table
+            golden_table = sa.Table(
+                'golden_records',
+                metadata,
+                sa.Column('id', sa.String(255), primary_key=True),
+                sa.Column('source', sa.String(50), nullable=False),
+                sa.Column('data', sa.JSON, nullable=False),
+                sa.Column('created_at', sa.DateTime, default=datetime.now),
+                sa.Column('updated_at', sa.DateTime, onupdate=datetime.now),
+                schema='mdm'  # Explicitly set schema
+            )
+            
+            # Create all tables
+            metadata.create_all(self.engine)
+            
+        except SQLAlchemyError as e:
+            self.logger.error(f"Failed to create physical model: {e}")
+            raise
+        
+    def store_golden_record(self, record: Dict[str, Any]):
+        """Store a golden record in the database.
         
         Args:
-            config: Data model configuration
-            engine: SQLAlchemy engine for database operations
-            logger: Optional logger instance
+            record: Dictionary containing the golden record data
         """
-        self.config = config
-        self.engine = engine
-        self.logger = logger or logging.getLogger(__name__)
+        try:
+            # Ensure required fields are present
+            if 'id' not in record:
+                raise ValueError("Golden record must have an 'id' field")
+            
+            # Convert any nested dictionaries to JSON strings
+            processed_record = {}
+            for key, value in record.items():
+                if isinstance(value, dict):
+                    processed_record[key] = json.dumps(value)
+                else:
+                    processed_record[key] = value
+            
+            # Create or update record
+            with self.engine.begin() as conn:
+                # Check if record exists
+                exists = conn.execute(
+                    text("SELECT 1 FROM mdm.golden_records WHERE id = :id"),
+                    {"id": record["id"]}
+                ).fetchone() is not None
+                
+                if exists:
+                    # Update existing record
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE mdm.golden_records
+                            SET data = :data,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :id
+                            """
+                        ),
+                        {
+                            "id": record["id"],
+                            "data": json.dumps(processed_record)
+                        }
+                    )
+                else:
+                    # Insert new record
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO mdm.golden_records (id, source, data, created_at, updated_at)
+                            VALUES (:id, :source, :data, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """
+                        ),
+                        {
+                            "id": record["id"],
+                            "source": record.get("source", "GOLDEN"),
+                            "data": json.dumps(processed_record)
+                        }
+                    )
+        except Exception as e:
+            self.logger.error(f"Failed to store golden record: {e}")
+            raise
         
-        # Validate configuration
-        errors = config.validate()
-        if errors:
-            raise ValueError(f"Invalid configuration: {', '.join(errors)}")
+    def get_golden_records(self) -> List[Dict[str, Any]]:
+        """Retrieve all golden records.
+        
+        Returns:
+            List of golden records
+        """
+        try:
+            stmt = text("SELECT * FROM mdm.golden_records")
+            with self.engine.connect() as conn:
+                result = conn.execute(stmt)
+                return [dict(row) for row in result]
+                
+        except SQLAlchemyError as e:
+            self.logger.error(f"Failed to retrieve golden records: {str(e)}")
+            raise
 
     def _get_sa_type(self, field: FieldConfig) -> sa.types.TypeEngine:
         """Convert OpenMatch data type to SQLAlchemy type."""
@@ -126,38 +217,13 @@ class DataModelManager:
             self.logger.error(f"Failed to drop table {schema}.{table_name}: {str(e)}")
             raise
 
-    def create_physical_model(self) -> None:
-        """Create the physical tables in the database based on the data model configuration."""
-        physical_model = self.config.to_physical_model()
-
-        for entity_name, tables in physical_model.items():
-            try:
-                # Drop existing tables first
-                self._drop_table(tables["master"]["name"], self.config.physical_model.schema_name)
-                self._drop_table(tables["history"]["name"], self.config.physical_model.schema_name)
-                self._drop_table(tables["xref"]["name"], self.config.physical_model.schema_name)
-
-                # Create master table
-                self._create_table(tables["master"], self.config.physical_model.schema_name)
-
-                # Create history table
-                self._create_table(tables["history"], self.config.physical_model.schema_name)
-
-                # Create cross-reference table
-                self._create_table(tables["xref"], self.config.physical_model.schema_name)
-
-                self.logger.info(f"Created tables for entity {entity_name}")
-            except Exception as e:
-                self.logger.error(f"Failed to create tables for entity {entity_name}: {str(e)}")
-                raise
-
     def discover_source_schema(
         self,
         source_name: str,
         table_name: str
     ) -> Dict[str, Any]:
         """Discover schema from a source system table."""
-        source_config = self.config.source_systems.get(source_name)
+        source_config = self.data_model.source_systems.get(source_name)
         if not source_config:
             raise ValueError(f"Unknown source system: {source_name}")
             
@@ -210,11 +276,11 @@ class DataModelManager:
         data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Apply field mappings from source to entity."""
-        source_config = self.config.source_systems.get(source_name)
+        source_config = self.data_model.source_systems.get(source_name)
         if not source_config:
             raise ValueError(f"Unknown source system: {source_name}")
             
-        entity_config = self.config.entities.get(entity_name)
+        entity_config = self.data_model.entities.get(entity_name)
         if not entity_config:
             raise ValueError(f"Unknown entity: {entity_name}")
             
@@ -235,7 +301,7 @@ class DataModelManager:
         data: Dict[str, Any]
     ) -> List[str]:
         """Validate data against entity configuration."""
-        entity_config = self.config.entities.get(entity_name)
+        entity_config = self.data_model.entities.get(entity_name)
         if not entity_config:
             raise ValueError(f"Unknown entity: {entity_name}")
             

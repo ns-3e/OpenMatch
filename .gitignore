@@ -43,6 +43,3 @@ ENV/
 .env
 .env.local
 *.log 
-
-
-quickstart/

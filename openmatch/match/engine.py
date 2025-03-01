@@ -1,595 +1,657 @@
-"""
-Match engine implementation for OpenMatch.
-"""
-
-from typing import Dict, List, Optional, Any, Tuple, Set
-from concurrent.futures import ThreadPoolExecutor
-import logging
-from functools import lru_cache
-import pandas as pd
-from collections import defaultdict
+from typing import Dict, List, Optional, Any, Tuple, Set, Union
 import numpy as np
-import uuid
+from functools import lru_cache
+from sentence_transformers import SentenceTransformer
+import faiss
+import psutil
+import gc
+import xxhash
+import time
+import math
+from dataclasses import dataclass
+from collections import defaultdict
+from .config import MatchConfig, MatchType
+from .rules import MatchRule
 from datetime import datetime
-import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import insert
+from tqdm import tqdm
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
 
-from openmatch.match.config import MatchConfig, BlockingConfig, MetadataConfig
-from openmatch.match.rules import MatchRules
-from openmatch.utils.logging import setup_logging
+class MemoryError(Exception):
+    """Raised when memory usage exceeds threshold."""
+    pass
 
+@dataclass
+class LSHVector:
+    """Locality-Sensitive Hashing vector for rapid approximate matching."""
+    signature: bytes
+    record_idx: int
+    confidence: float = 1.0
+    
+    def __hash__(self):
+        return hash(self.signature)
+    
+    def __eq__(self, other):
+        return isinstance(other, LSHVector) and self.signature == other.signature
 
 class MatchEngine:
-    """Main engine for record matching."""
+    """Core matching engine implementation with optimizations for large datasets."""
     
-    def __init__(
-        self,
-        config: MatchConfig,
-        metadata_config: Optional[MetadataConfig] = None,
-        db_engine: Optional[sa.engine.Engine] = None,
-        logger: Optional[logging.Logger] = None
-    ):
-        """Initialize the match engine.
-        
-        Args:
-            config: Match configuration
-            metadata_config: Optional metadata table configuration
-            db_engine: SQLAlchemy database engine for metadata storage
-            logger: Optional logger instance
-        """
+    def __init__(self, config: MatchConfig):
         self.config = config
-        self.metadata_config = metadata_config or MetadataConfig()
-        self.db_engine = db_engine
-        self.logger = logger or logging.getLogger(__name__)
-        self.batch_id = str(uuid.uuid4())
+        self.rules = [MatchRule(rule_config) for rule_config in config.rules]
+        self.memory_threshold = 0.90  # 90% memory usage threshold
+        self.embedding_batch_size = 128  # Increased batch size
+        self.blocking_cache = {}  # Cache for blocking key values
+        self.lsh_tables = {}  # LSH tables for approximate matching
+        self.hash_functions = 8  # Number of hash functions for LSH
+        self.performance_stats = defaultdict(float)  # Performance monitoring
+        self.last_memory_check = time.time()  # Initialize memory check time
+        self.memory_check_interval = 5  # Check memory every 5 seconds
+        self.embedding_model = None  # Initialize as None
+        self.model_id = f"{config.blocking.embedding_model}_{int(time.time())}"  # Unique model ID
         
-        # Validate configuration
-        errors = config.validate()
-        if errors:
-            raise ValueError(f"Invalid configuration: {', '.join(errors)}")
-            
-        # Initialize caching if enabled
-        if config.enable_caching:
-            self.match_field = lru_cache(maxsize=config.cache_size)(self._match_field)
-        else:
-            self.match_field = self._match_field
-            
-        # Initialize metadata tables if database engine is provided
-        if db_engine and metadata_config:
-            self._initialize_metadata_tables()
-
-    def _initialize_metadata_tables(self):
-        """Initialize metadata tables in the database."""
-        try:
-            # Execute DDL statements
-            with self.db_engine.begin() as conn:
-                for ddl in self.metadata_config.get_ddl_statements():
-                    conn.execute(sa.text(ddl))
-            self.logger.info("Successfully initialized metadata tables")
-        except Exception as e:
-            self.logger.error(f"Error initializing metadata tables: {e}")
-            raise
-
-    def _get_processed_source_ids(self, source_system: str) -> Set[str]:
-        """Get set of source IDs that have already been processed."""
-        if not self.db_engine:
-            return set()
-            
-        query = f"""
-        SELECT source_id FROM {self.metadata_config.get_table_name('xref')}
-        WHERE source_system = :source_system
-        """
-        try:
-            with self.db_engine.connect() as conn:
-                result = conn.execute(
-                    sa.text(query),
-                    {"source_system": source_system}
-                )
-                return {row[0] for row in result}
-        except Exception as e:
-            self.logger.error(f"Error retrieving processed source IDs: {e}")
-            return set()
-
-    def _get_candidate_masters(
-        self,
-        blocking_key: str,
-        min_score: float = 0.0
-    ) -> List[Dict[str, Any]]:
-        """Get candidate master records for matching based on blocking key."""
-        if not self.db_engine:
-            return []
-            
-        query = f"""
-        SELECT m.master_id, m.golden_record, m.match_score
-        FROM {self.metadata_config.get_table_name('master')} m
-        JOIN {self.metadata_config.get_table_name('xref')} x
-            ON m.master_id = x.master_id
-        WHERE x.status = 'ACTIVE'
-        AND m.match_score >= :min_score
-        """
+        # Initialize components
+        self._initialize_embedding_model()
+        if self.embedding_model is not None:  # Only initialize index if model loaded
+            self._initialize_vector_index()
         
-        try:
-            with self.db_engine.connect() as conn:
-                result = conn.execute(
-                    sa.text(query),
-                    {"min_score": min_score}
-                )
-                return [dict(row) for row in result]
-        except Exception as e:
-            self.logger.error(f"Error retrieving candidate masters: {e}")
-            return []
-
-    def _store_match_result(
-        self,
-        source_id: str,
-        source_system: str,
-        master_id: Optional[str],
-        match_score: float,
-        field_scores: Dict[str, float],
-        match_rule: str,
-        source_data: Dict[str, Any]
-    ):
-        """Store match result in metadata tables."""
-        if not self.db_engine:
+    def _check_memory(self, force=False):
+        """Check if memory usage is below threshold, with rate limiting."""
+        current_time = time.time()
+        if not force and current_time - self.last_memory_check < self.memory_check_interval:
             return
             
+        self.last_memory_check = current_time
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent / 100.0  # Convert to decimal
+        
+        if memory_percent > self.memory_threshold:
+            gc.collect()  # Try to free memory
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent / 100.0
+            if memory_percent > self.memory_threshold:
+                raise MemoryError(f"Memory usage ({memory_percent*100:.1f}%) exceeds threshold ({self.memory_threshold*100}%)")
+        
+    def _initialize_embedding_model(self):
+        """Initialize the SentenceTransformer model for embeddings."""
         try:
-            with self.db_engine.begin() as conn:
-                # Insert match result
-                match_id = str(uuid.uuid4())
-                conn.execute(
-                    sa.text(f"""
-                    INSERT INTO {self.metadata_config.get_table_name('results')}
-                    (match_id, source_id, master_id, match_score, field_scores,
-                     match_rule, batch_id, created_at)
-                    VALUES
-                    (:match_id, :source_id, :master_id, :match_score, :field_scores,
-                     :match_rule, :batch_id, CURRENT_TIMESTAMP)
-                    """),
-                    {
-                        "match_id": match_id,
-                        "source_id": source_id,
-                        "master_id": master_id,
-                        "match_score": match_score,
-                        "field_scores": field_scores,
-                        "match_rule": match_rule,
-                        "batch_id": self.batch_id
-                    }
-                )
-                
-                # Insert or update xref record
-                conn.execute(
-                    sa.text(f"""
-                    INSERT INTO {self.metadata_config.get_table_name('xref')}
-                    (xref_id, source_id, source_system, master_id, match_score,
-                     created_at, last_updated, source_data)
-                    VALUES
-                    (:xref_id, :source_id, :source_system, :master_id, :match_score,
-                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, :source_data)
-                    ON CONFLICT (source_id, source_system)
-                    DO UPDATE SET
-                        master_id = EXCLUDED.master_id,
-                        match_score = EXCLUDED.match_score,
-                        last_updated = CURRENT_TIMESTAMP,
-                        source_data = EXCLUDED.source_data
-                    """),
-                    {
-                        "xref_id": str(uuid.uuid4()),
-                        "source_id": source_id,
-                        "source_system": source_system,
-                        "master_id": master_id,
-                        "match_score": match_score,
-                        "source_data": source_data
-                    }
-                )
-                
-        except Exception as e:
-            self.logger.error(f"Error storing match result: {e}")
-
-    def _update_match_statistics(
-        self,
-        total_records: int,
-        matched_records: int,
-        potential_matches: int,
-        new_masters: int,
-        updated_masters: int,
-        start_time: datetime,
-        performance_metrics: Dict[str, Any]
-    ):
-        """Update match statistics for the current batch."""
-        if not self.db_engine:
-            return
+            # Force CPU on macOS to avoid MPS memory issues
+            import platform
+            device = "cpu" if platform.system() == "Darwin" else ("cuda" if self.config.use_gpu else "cpu")
             
-        try:
-            with self.db_engine.begin() as conn:
-                conn.execute(
-                    sa.text(f"""
-                    INSERT INTO {self.metadata_config.get_table_name('stats')}
-                    (stat_id, batch_id, start_time, end_time, total_records,
-                     matched_records, potential_matches, new_masters, updated_masters,
-                     avg_match_score, performance_metrics)
-                    VALUES
-                    (:stat_id, :batch_id, :start_time, CURRENT_TIMESTAMP, :total_records,
-                     :matched_records, :potential_matches, :new_masters, :updated_masters,
-                     :avg_match_score, :performance_metrics)
-                    """),
-                    {
-                        "stat_id": str(uuid.uuid4()),
-                        "batch_id": self.batch_id,
-                        "start_time": start_time,
-                        "total_records": total_records,
-                        "matched_records": matched_records,
-                        "potential_matches": potential_matches,
-                        "new_masters": new_masters,
-                        "updated_masters": updated_masters,
-                        "avg_match_score": matched_records / total_records if total_records > 0 else 0,
-                        "performance_metrics": performance_metrics
-                    }
+            try:
+                self.embedding_model = SentenceTransformer(
+                    self.config.blocking.embedding_model,
+                    device=device
                 )
-        except Exception as e:
-            self.logger.error(f"Error updating match statistics: {e}")
-
-    def find_matches_incremental(
-        self,
-        records: List[Dict[str, Any]],
-        source_system: str,
-        batch_size: int = 1000
-    ) -> List[Tuple[Dict[str, Any], Dict[str, Any], float, Dict[str, float]]]:
-        """Find matches incrementally, only processing new records.
-        
-        Args:
-            records: New records to match
-            source_system: Source system identifier
-            batch_size: Size of batches for processing
+            except Exception as e:
+                print(f"Warning: Failed to load primary model: {str(e)}")
+                print("Falling back to smaller model...")
+                self.embedding_model = SentenceTransformer(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    device="cpu"  # Always use CPU for fallback model
+                )
             
-        Returns:
-            List of (record1, record2, overall_score, field_scores) tuples
-        """
-        start_time = datetime.now()
-        performance_metrics = defaultdict(float)
-        
-        # Get already processed source IDs
-        processed_ids = self._get_processed_source_ids(source_system)
-        
-        # Filter out already processed records
-        new_records = [
-            r for r in records
-            if str(r.get('id', '')) not in processed_ids
+            # Verify model loaded correctly
+            if self.embedding_model is None:
+                raise ValueError("Failed to initialize embedding model")
+                
+            # Precompute and cache embeddings for common values
+            self._precompute_common_embeddings()
+        except Exception as e:
+            print(f"Critical: Could not initialize any embedding model: {str(e)}")
+            self.embedding_model = None  # Ensure it's None if initialization failed
+    
+    def _precompute_common_embeddings(self):
+        """Precompute and cache embeddings for common values."""
+        # Common values that might appear in records
+        common_values = [
+            "unknown", "n/a", "na", "none", "null", 
+            "male", "female", "m", "f",
+            "active", "inactive", "pending",
+            "usa", "united states", "canada", "uk", "australia"
         ]
         
-        if not new_records:
-            self.logger.info("No new records to process")
-            return []
-            
-        self.logger.info(f"Processing {len(new_records)} new records")
+        # Precompute embeddings
+        for value in common_values:
+            _ = self.compute_embedding(value)
         
-        matches = []
-        total_matches = 0
-        new_masters = 0
-        updated_masters = 0
+    def _initialize_vector_index(self):
+        """Initialize FAISS index for vector similarity search with optimizations for large datasets."""
+        num_fuzzy_fields = sum(1 for rule in self.rules 
+                              for field in rule.config.fields 
+                              if field.match_type == MatchType.FUZZY)
+        embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+        total_dim = embedding_dim * num_fuzzy_fields
         
-        # Process records in batches
-        for i in range(0, len(new_records), batch_size):
-            batch = new_records[i:i + batch_size]
-            batch_start = datetime.now()
+        # Create an optimized index based on dataset size
+        estimated_vectors = self.config.expected_records or 10000  # Default estimate
+        
+        if estimated_vectors > 1000000:  # Extremely large dataset (>1M records)
+            # Use HNSW index for faster search with very large datasets
+            M = 16  # Number of connections per layer (higher = better recall, more memory)
+            ef_construction = 80  # Higher values create higher quality graphs (but slower construction)
             
-            # Apply blocking if configured
-            if self.config.blocking:
-                record_blocks = self._apply_blocking(batch, [])
+            if self.config.use_gpu:
+                res = faiss.StandardGpuResources()
+                # Use scalar quantizer for compression
+                self.index = faiss.GpuIndexIVFScalarQuantizer(
+                    res, total_dim, min(4096, estimated_vectors // 1000), 
+                    faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_INNER_PRODUCT
+                )
             else:
-                record_blocks = [(batch, [])]
+                # For CPU, use HNSW which works well for large datasets
+                self.index = faiss.IndexHNSWFlat(total_dim, M, faiss.METRIC_INNER_PRODUCT)
+                self.index.hnsw.efConstruction = ef_construction
+                self.index.hnsw.efSearch = 128  # Higher values = higher recall (but slower search)
+        else:
+            # Medium-sized dataset, use IVF
+            nlist = max(4, min(int(math.sqrt(estimated_vectors)), 1024))  # Number of clusters, scaled with dataset size
+            quantizer = faiss.IndexFlatIP(total_dim)
+            
+            if self.config.use_gpu:
+                res = faiss.StandardGpuResources()
+                self.index = faiss.GpuIndexIVFFlat(res, total_dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            else:
+                self.index = faiss.IndexIVFFlat(quantizer, total_dim, nlist, faiss.METRIC_INNER_PRODUCT)
                 
-            # Process each block
-            for block_records, _ in record_blocks:
-                for record in block_records:
-                    # Get candidate masters based on blocking key
-                    blocking_key = self._get_block_key(record)
-                    candidates = self._get_candidate_masters(
-                        blocking_key,
-                        min_score=self.config.min_overall_score
+                # For large datasets, consider product quantization
+                if estimated_vectors > 100000:
+                    # Use product quantization for memory efficiency
+                    m = total_dim // 4  # Number of subquantizers (dimension must be multiple of m)
+                    m = min(m, 64)  # Cap at 64 subquantizers
+                    m = max(1, m)   # Ensure at least 1 subquantizer
+                    bits = 8        # Bits per subquantizer
+                    self.index = faiss.IndexIVFPQ(quantizer, total_dim, nlist, m, bits, faiss.METRIC_INNER_PRODUCT)
+        
+        # Set search parameters
+        if hasattr(self.index, 'nprobe'):
+            # For IVF indexes (including GPU ones)
+            self.index.nprobe = min(nlist, 32)  # Check more clusters for better recall
+        
+        # For training, we'll do this when data is available
+        self.index_trained = False
+    
+    def train_index(self, vectors: np.ndarray):
+        """Train the FAISS index with representative vectors."""
+        if not self.index_trained and hasattr(self.index, 'train'):
+            try:
+                print(f"Training index with {len(vectors)} vectors...")
+                self.index.train(vectors)
+                self.index_trained = True
+                print("Index trained successfully")
+            except Exception as e:
+                print(f"Warning: Failed to train index: {str(e)}")
+    
+    @lru_cache(maxsize=10000)  # Increased cache size
+    def compute_embedding(self, text: str) -> np.ndarray:
+        """Compute embedding for a text string with caching."""
+        self._check_memory()
+        try:
+            if not text or text.lower() in ['null', 'none', 'na', 'n/a', '']:
+                # Return zero vector for empty or null values
+                return np.zeros(self.embedding_model.get_sentence_embedding_dimension())
+                
+            return self.embedding_model.encode([text])[0]
+        except Exception as e:
+            print(f"Warning: Failed to compute embedding: {str(e)}")
+            # Return zero vector as fallback
+            return np.zeros(self.embedding_model.get_sentence_embedding_dimension())
+    
+    def compute_embeddings_batch(self, texts: List[str]) -> np.ndarray:
+        """Compute embeddings for multiple texts in batches with optimized memory usage."""
+        self._check_memory()
+        
+        # Filter out null values
+        valid_texts = []
+        valid_indices = []
+        
+        for i, text in enumerate(texts):
+            if text and text.lower() not in ['null', 'none', 'na', 'n/a', '']:
+                valid_texts.append(text)
+                valid_indices.append(i)
+        
+        if not valid_texts:
+            # Return zero vectors if no valid texts
+            return np.zeros((len(texts), self.embedding_model.get_sentence_embedding_dimension()))
+        
+        # Process in smaller batches to manage memory
+        all_embeddings = np.zeros((len(texts), self.embedding_model.get_sentence_embedding_dimension()))
+        
+        for i in range(0, len(valid_texts), self.embedding_batch_size):
+            batch_texts = valid_texts[i:i + self.embedding_batch_size]
+            batch_indices = valid_indices[i:i + self.embedding_batch_size]
+            
+            try:
+                batch_embeddings = self.embedding_model.encode(batch_texts)
+                
+                # Place embeddings in the correct positions
+                for j, idx in enumerate(batch_indices):
+                    all_embeddings[idx] = batch_embeddings[j]
+                    
+                self._check_memory(force=False)  # Check memory periodically, not after each batch
+            except Exception as e:
+                print(f"Warning: Failed to compute batch embeddings: {str(e)}")
+        
+        return all_embeddings
+    
+    def compute_blocking_tensor(self, record: Dict[str, Any]) -> np.ndarray:
+        """Compute blocking tensor for a record with improved memory efficiency."""
+        self._check_memory(force=False)
+        
+        # Check for cached tensor
+        record_id = record.get('id') or hash(frozenset(record.items()))
+        cache_key = f"tensor_{record_id}"
+        if cache_key in self.blocking_cache:
+            return self.blocking_cache[cache_key]
+        
+        # Extract texts for all fuzzy fields in one go
+        field_texts = []
+        field_names = []
+        
+        for rule in self.rules:
+            for field in rule.config.fields:
+                if field.match_type == MatchType.FUZZY and field.name in record:
+                    field_texts.append(str(record[field.name]))
+                    field_names.append(field.name)
+        
+        if not field_texts:
+            raise ValueError("No fuzzy fields found for blocking tensor computation")
+        
+        # Compute embeddings in a single batch
+        embeddings = self.compute_embeddings_batch(field_texts)
+        
+        # Concatenate and normalize
+        tensor = np.concatenate(embeddings)
+        normalized_tensor = tensor / (np.linalg.norm(tensor) + 1e-8)
+        
+        # Cache the tensor
+        if len(self.blocking_cache) < 100000:  # Limit cache size
+            self.blocking_cache[cache_key] = normalized_tensor
+            
+        return normalized_tensor
+    
+    def compute_lsh_signature(self, record: Dict[str, Any], field_name: str) -> bytes:
+        """Compute LSH signature for a field value."""
+        if field_name not in record:
+            return b''
+            
+        value = str(record[field_name]).lower()
+        if not value or value in ['null', 'none', 'na', 'n/a']:
+            return b''
+            
+        # Generate multiple hashes for robustness
+        signature_parts = []
+        for i in range(self.hash_functions):
+            # Use different seed for each hash function
+            h = xxhash.xxh64(value, seed=i).digest()
+            signature_parts.append(h)
+            
+        return b''.join(signature_parts)
+    
+    def add_to_lsh_tables(self, record: Dict[str, Any], idx: int):
+        """Add a record to LSH tables for approximate matching."""
+        for rule in self.rules:
+            for field in rule.config.fields:
+                if field.match_type in [MatchType.FUZZY, MatchType.EXACT]:
+                    signature = self.compute_lsh_signature(record, field.name)
+                    if not signature:
+                        continue
+                        
+                    field_table = self.lsh_tables.setdefault(field.name, {})
+                    vectors = field_table.setdefault(signature, set())
+                    vectors.add(LSHVector(signature=signature, record_idx=idx))
+    
+    def find_lsh_candidates(self, record: Dict[str, Any]) -> Set[int]:
+        """Find candidate matches using LSH tables."""
+        candidates = set()
+        
+        for rule in self.rules:
+            rule_candidates = set()
+            
+            for field in rule.config.fields:
+                if field.match_type in [MatchType.FUZZY, MatchType.EXACT]:
+                    signature = self.compute_lsh_signature(record, field.name)
+                    if not signature:
+                        continue
+                        
+                    field_table = self.lsh_tables.get(field.name, {})
+                    vectors = field_table.get(signature, set())
+                    
+                    # Collect candidates from this field
+                    field_candidates = {vector.record_idx for vector in vectors}
+                    
+                    if not rule_candidates:
+                        rule_candidates = field_candidates
+                    else:
+                        # Require matching on all fields in the rule (AND logic)
+                        rule_candidates &= field_candidates
+            
+            # Combine candidates from different rules (OR logic)
+            candidates |= rule_candidates
+        
+        return candidates
+    
+    def get_blocking_key(self, record: Dict[str, Any]) -> str:
+        """Generate adaptive blocking key from configured blocking fields."""
+        # Check if key is already in cache
+        record_id = record.get('id') or hash(frozenset(record.items()))
+        cache_key = f"block_{record_id}"
+        if cache_key in self.blocking_cache:
+            return self.blocking_cache[cache_key]
+        
+        key_parts = []
+        for field in self.config.blocking.blocking_keys:
+            value = record.get(field, "")
+            
+            # Handle different field types appropriately
+            if isinstance(value, (int, float)):
+                # For numeric fields, create range-based blocks
+                # Use exponential binning for more even distribution
+                if value == 0:
+                    binned_value = "0"
+                else:
+                    magnitude = math.floor(math.log10(abs(value) + 1))
+                    bin_size = 10 ** magnitude
+                    binned_value = str(int(value // bin_size) * bin_size)
+                key_parts.append(binned_value)
+            elif isinstance(value, str):
+                if not value or value.lower() in ['null', 'none', 'na', 'n/a']:
+                    key_parts.append("missing")
+                else:
+                    # Use more sophisticated tokenization for strings
+                    # 1. Convert to lowercase
+                    value = value.lower()
+                    # 2. Keep only the first token or first 3 characters
+                    if ' ' in value:
+                        value = value.split()[0]  # First token
+                    value = value[:3]  # First 3 chars
+                    key_parts.append(value)
+            else:
+                key_parts.append("unknown")
+        
+        # Create the blocking key
+        blocking_key = "|".join(key_parts)
+        
+        # Cache the result if cache isn't too large
+        if len(self.blocking_cache) < 100000:  # Limit cache size
+            self.blocking_cache[cache_key] = blocking_key
+            
+        return blocking_key
+    
+    def add_record(self, record: Dict[str, Any], record_id: Any = None) -> None:
+        """Add a record to the matching engine with optimizations for large datasets."""
+        self._check_memory()
+        
+        # Add to LSH tables
+        if record_id is not None:
+            self.add_to_lsh_tables(record, record_id)
+        
+        # Add to vector index
+        try:
+            blocking_tensor = self.compute_blocking_tensor(record)
+            self.index.add(np.array([blocking_tensor]))
+        except Exception as e:
+            print(f"Warning: Failed to add record to vector index: {str(e)}")
+    
+    def add_records_batch(self, records: List[Dict[str, Any]]) -> None:
+        """Add multiple records in batch for better performance."""
+        self._check_memory()
+        
+        # Extract all tensors first
+        tensors = []
+        for i, record in enumerate(records):
+            try:
+                # Add to LSH tables
+                self.add_to_lsh_tables(record, i)
+                
+                # Compute tensor
+                tensor = self.compute_blocking_tensor(record)
+                tensors.append(tensor)
+            except Exception as e:
+                print(f"Warning: Failed to process record {i}: {str(e)}")
+        
+        if tensors:
+            # Convert to numpy array
+            tensors_array = np.vstack(tensors)
+            
+            # Train index if not trained yet
+            if not self.index_trained and hasattr(self.index, 'train'):
+                self.train_index(tensors_array)
+            
+            # Add to index
+            self.index.add(tensors_array)
+    
+    def find_candidates(
+        self, 
+        query_record: Dict[str, Any], 
+        k: int = 100,
+        use_lsh: bool = True
+    ) -> List[Tuple[int, float]]:
+        """Find candidate matches with hybrid approach (LSH + vector search)."""
+        self._check_memory()
+        
+        candidates = set()
+        
+        # 1. Use LSH for approximate matching (very fast)
+        if use_lsh:
+            lsh_candidates = self.find_lsh_candidates(query_record)
+            candidates.update(lsh_candidates)
+        
+        # 2. Use vector search if we don't have enough candidates or LSH is disabled
+        if len(candidates) < k or not use_lsh:
+            try:
+                query_tensor = self.compute_blocking_tensor(query_record)
+                search_k = min(k, self.index.ntotal) if hasattr(self.index, 'ntotal') else k
+                
+                if search_k > 0:  # Only search if we have records in the index
+                    distances, indices = self.index.search(
+                        np.array([query_tensor]), 
+                        search_k
                     )
                     
-                    best_match = None
-                    best_score = 0
-                    best_field_scores = {}
-                    
-                    # Compare with candidates
-                    for candidate in candidates:
-                        score, field_scores = self.match_records(
-                            record,
-                            candidate['golden_record']
-                        )
-                        
-                        if score >= self.config.min_overall_score and score > best_score:
-                            best_match = candidate
-                            best_score = score
-                            best_field_scores = field_scores
-                    
-                    # Store match result
-                    if best_match:
-                        matches.append((
-                            record,
-                            best_match['golden_record'],
-                            best_score,
-                            best_field_scores
-                        ))
-                        updated_masters += 1
-                    else:
-                        # Create new master record
-                        new_master_id = str(uuid.uuid4())
-                        self._store_match_result(
-                            source_id=str(record.get('id', '')),
-                            source_system=source_system,
-                            master_id=new_master_id,
-                            match_score=1.0,  # Perfect score for new master
-                            field_scores={},
-                            match_rule="NEW_MASTER",
-                            source_data=record
-                        )
-                        new_masters += 1
-                    
-                    total_matches += 1
-            
-            # Update performance metrics
-            batch_duration = (datetime.now() - batch_start).total_seconds()
-            performance_metrics['avg_batch_duration'] += batch_duration
-            performance_metrics['records_per_second'] = len(batch) / batch_duration
-            
-            self.logger.info(
-                f"Processed batch {i//batch_size + 1}, "
-                f"records {i} to {min(i + batch_size, len(new_records))}"
-            )
+                    # Add vector search results to candidates
+                    for idx, dist in zip(indices[0], distances[0]):
+                        if idx != -1:  # FAISS returns -1 for invalid indices
+                            candidates.add((int(idx), float(dist)))
+            except Exception as e:
+                print(f"Warning: Vector search failed: {str(e)}")
         
-        # Update final statistics
-        self._update_match_statistics(
-            total_records=len(new_records),
-            matched_records=total_matches,
-            potential_matches=len(matches),
-            new_masters=new_masters,
-            updated_masters=updated_masters,
-            start_time=start_time,
-            performance_metrics=dict(performance_metrics)
-        )
+        # Convert candidates to the expected format
+        valid_results = list(candidates)
+        if not all(isinstance(c, tuple) for c in valid_results):
+            # Convert any non-tuple candidates to tuples with default distance
+            valid_results = [(c, 1.0) if not isinstance(c, tuple) else c for c in valid_results]
+            
+        # Sort by distance (higher is better for inner product)
+        valid_results.sort(key=lambda x: x[1], reverse=True)
         
-        return matches
-
+        # Limit to k results
+        return valid_results[:k]
+    
     def match_records(
         self,
         record1: Dict[str, Any],
-        record2: Dict[str, Any]
-    ) -> Tuple[float, Dict[str, float]]:
-        """Match two records and return overall score and field scores.
+        record2: Dict[str, Any],
+        fast_mode: bool = False
+    ) -> Tuple[MatchType, float, Optional[str]]:
+        """Match two records and return match type, score, and the rule ID that caused the match."""
+        try:
+            # Check memory usage periodically
+            self._check_memory()
+            
+            # Try each rule in order
+            for rule in self.rules:
+                match_type, score = rule.apply(record1, record2, fast_mode)
+                if match_type != MatchType.NO_MATCH:
+                    return match_type, score, rule.config.rule_id
+            
+            # No rules matched
+            return MatchType.NO_MATCH, 0.0, None
+            
+        except Exception as e:
+            print(f"Warning: Match operation failed: {str(e)}")
+            return MatchType.ERROR, 0.0, None
+    
+    def process_batch(
+        self, 
+        records: List[Dict[str, Any]], 
+        batch_size: Optional[int] = None,
+        use_progressive_blocking: bool = True
+    ) -> List[Tuple[int, int, MatchType, float]]:
+        """Process a batch of records using optimized blocking and progressive matching."""
+        self._check_memory()
+        batch_size = batch_size or self.config.batch_size
+        matches = []
+        start_time = time.time()
         
-        Args:
-            record1: First record to compare
-            record2: Second record to compare
-            
-        Returns:
-            Tuple of (overall_score, field_scores)
-        """
-        field_scores = {}
-        total_weight = self.config.get_total_weight()
+        # Initialize statistics
+        stats = {
+            'total_records': len(records),
+            'exact_matches': 0,
+            'potential_matches': 0,
+            'processed_pairs': 0
+        }
         
-        for field_name, field_config in self.config.field_configs.items():
-            value1 = record1.get(field_name)
-            value2 = record2.get(field_name)
+        console = Console()
+        
+        # Create progress display
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
             
-            score = self.match_field(value1, value2, field_config)
-            field_scores[field_name] = score
+            main_task = progress.add_task(f"[cyan]Processing {len(records)} records...", total=100)
             
-        # Calculate overall score based on aggregation method
-        if self.config.score_aggregation == "weighted_average":
-            if total_weight == 0:
-                overall_score = 0.0
-            else:
-                overall_score = sum(
-                    score * self.config.get_field_weight(field)
-                    for field, score in field_scores.items()
-                ) / total_weight
-        elif self.config.score_aggregation == "min":
-            overall_score = min(field_scores.values())
-        elif self.config.score_aggregation == "max":
-            overall_score = max(field_scores.values())
-        else:
-            raise ValueError(
-                f"Unsupported score aggregation method: {self.config.score_aggregation}"
-            )
+            # Index all records for vector search
+            if len(records) > 1000:  # Only build index for larger batches
+                index_task = progress.add_task("[yellow]Indexing records...", total=len(records))
+                self.add_records_batch(records)
+                progress.update(index_task, completed=len(records))
             
-        return overall_score, field_scores
+            if use_progressive_blocking:
+                # Progressive blocking approach
+                # 1. First do exact blocking on key fields (fastest)
+                exact_blocks = defaultdict(list)
+                blocking_task = progress.add_task("[green]Building blocking groups...", total=len(records))
+                
+                for idx, record in enumerate(records):
+                    for field in self.config.blocking.blocking_keys:
+                        if field in record and record[field]:
+                            # Create exact match key
+                            key = f"{field}:{record[field]}"
+                            exact_blocks[key].append((idx, record))
+                    progress.update(blocking_task, advance=1)
+                
+                # Process exact blocks (these are guaranteed matches on at least one field)
+                total_comparisons = sum(len(block) * (len(block) - 1) // 2 for block in exact_blocks.values())
+                exact_task = progress.add_task("[blue]Processing exact matches...", total=total_comparisons)
+                
+                for key, block_records in exact_blocks.items():
+                    if len(block_records) > 1:  # Only process blocks with potential matches
+                        for i, (idx1, record1) in enumerate(block_records):
+                            for idx2, record2 in block_records[i+1:]:
+                                match_type, confidence, rule_id = self.match_records(record1, record2)
+                                if match_type != MatchType.NO_MATCH:
+                                    matches.append((
+                                        idx1,
+                                        idx2,
+                                        match_type,
+                                        float(confidence)
+                                    ))
+                                    if match_type == MatchType.EXACT:
+                                        stats['exact_matches'] += 1
+                                    else:
+                                        stats['potential_matches'] += 1
+                                stats['processed_pairs'] += 1
+                                progress.update(exact_task, advance=1)
+                                progress.update(main_task, completed=min(100, int((stats['processed_pairs'] / total_comparisons) * 100)))
+                
+                # 2. Then do approximate blocking with LSH for fuzzy matches
+                if not matches or len(matches) < (len(records) * 0.01):  # If very few exact matches
+                    approx_task = progress.add_task("[magenta]Processing approximate matches...", total=len(records))
+                    # Group records by LSH signature
+                    for idx, record in enumerate(records):
+                        if not any(idx == match[0] or idx == match[1] for match in matches):
+                            # Only process records that aren't matched yet
+                            candidates = self.find_candidates(record, k=min(50, len(records)))
+                            
+                            for candidate_idx, _ in candidates:
+                                if (candidate_idx < len(records) and candidate_idx != idx and 
+                                    not any((idx == match[0] and candidate_idx == match[1]) or 
+                                           (idx == match[1] and candidate_idx == match[0]) 
+                                           for match in matches)):
+                                    
+                                    record2 = records[candidate_idx]
+                                    match_type, confidence, rule_id = self.match_records(record, record2)
+                                    if match_type != MatchType.NO_MATCH:
+                                        matches.append((
+                                            idx,
+                                            candidate_idx,
+                                            match_type,
+                                            float(confidence)
+                                        ))
+                                        if match_type == MatchType.EXACT:
+                                            stats['exact_matches'] += 1
+                                        else:
+                                            stats['potential_matches'] += 1
+                                    stats['processed_pairs'] += 1
+                        progress.update(approx_task, advance=1)
+                        progress.update(main_task, completed=min(100, int((idx / len(records)) * 100)))
 
-    def find_matches(
-        self,
-        records: List[Dict[str, Any]],
-        comparison_records: Optional[List[Dict[str, Any]]] = None
-    ) -> List[Tuple[Dict[str, Any], Dict[str, Any], float, Dict[str, float]]]:
-        """Find matches between records.
+            # Print final statistics
+            console.print("\n[bold]Match Statistics:[/bold]")
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("Metric", style="dim")
+            table.add_column("Value", justify="right")
+            table.add_row("Total Records", str(stats['total_records']))
+            table.add_row("Processed Pairs", str(stats['processed_pairs']))
+            table.add_row("Exact Matches", str(stats['exact_matches']))
+            table.add_row("Potential Matches", str(stats['potential_matches']))
+            table.add_row("Processing Time", f"{time.time() - start_time:.2f}s")
+            console.print(table)
+
+        return matches
         
-        Args:
-            records: Records to match
-            comparison_records: Optional separate set of records to compare against
-                             If not provided, matches within records
-                             
-        Returns:
-            List of (record1, record2, overall_score, field_scores) tuples
-        """
-        if comparison_records is None:
-            comparison_records = records
-            
-        # Apply blocking if configured
-        if self.config.blocking:
-            record_blocks = self._apply_blocking(records, comparison_records)
-        else:
-            # No blocking - compare all records
-            record_blocks = [(records, comparison_records)]
-            
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics."""
+        stats = dict(self.performance_stats)
+        stats['avg_match_time_ms'] = (stats.get('match_time', 0) / max(1, stats.get('matches_processed', 1))) * 1000
+        return stats
+
+    def _process_record_batch(
+        self,
+        records: List[Tuple[int, int, Dict, Dict, str, str, str]]
+    ) -> List[Dict[str, Any]]:
+        """Process a batch of records and return match results with model and rule IDs."""
         matches = []
         
-        # Process each block
-        for block_records, block_comparisons in record_blocks:
-            block_matches = self._process_block(block_records, block_comparisons)
-            matches.extend(block_matches)
-            
-        # Sort matches by score descending
-        matches.sort(key=lambda x: x[2], reverse=True)
-        
-        return matches
-
-    def _match_field(
-        self,
-        value1: Any,
-        value2: Any,
-        field_config: Any
-    ) -> float:
-        """Match two field values according to configuration."""
-        return MatchRules.match_field(value1, value2, field_config)
-
-    def _apply_blocking(
-        self,
-        records: List[Dict[str, Any]],
-        comparison_records: List[Dict[str, Any]]
-    ) -> List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
-        """Apply blocking to reduce comparison space."""
-        if not self.config.blocking:
-            return [(records, comparison_records)]
-            
-        blocks = defaultdict(lambda: ([], []))
-        
-        # Helper function to get block key
-        def get_block_key(record: Dict[str, Any]) -> str:
-            if self.config.blocking.method == "standard":
-                # Concatenate blocking key values
-                return "|".join(
-                    str(record.get(key, ""))
-                    for key in self.config.blocking.blocking_keys
-                )
-            elif self.config.blocking.method == "sorted_neighborhood":
-                # Use first blocking key for sorting
-                return str(record.get(self.config.blocking.blocking_keys[0], ""))
-            else:
-                raise ValueError(
-                    f"Unsupported blocking method: {self.config.blocking.method}"
-                )
+        for record_id1, record_id2, data1, data2, system1, system2, block_key in records:
+            try:
+                match_type, score, rule_id = self.match_records(data1, data2)
                 
-        # Assign records to blocks
-        for record in records:
-            block_key = get_block_key(record)
-            blocks[block_key][0].append(record)
-            
-        for record in comparison_records:
-            block_key = get_block_key(record)
-            blocks[block_key][1].append(record)
-            
-        # Handle sorted neighborhood method
-        if (self.config.blocking.method == "sorted_neighborhood" and
-            self.config.blocking.parameters.get("window_size", 0) > 0):
-            window_size = self.config.blocking.parameters["window_size"]
-            sorted_keys = sorted(blocks.keys())
-            expanded_blocks = defaultdict(lambda: ([], []))
-            
-            for i, key in enumerate(sorted_keys):
-                # Add records from window
-                start_idx = max(0, i - window_size)
-                end_idx = min(len(sorted_keys), i + window_size + 1)
-                
-                for j in range(start_idx, end_idx):
-                    window_key = sorted_keys[j]
-                    expanded_blocks[key][0].extend(blocks[window_key][0])
-                    expanded_blocks[key][1].extend(blocks[window_key][1])
+                if match_type != MatchType.NO_MATCH and score >= self.config.min_match_score:
+                    matches.append({
+                        'record_id_1': record_id1,
+                        'record_id_2': record_id2,
+                        'match_score': float(score),
+                        'match_type': match_type.value,
+                        'match_model_id': self.model_id,
+                        'match_rule_id': rule_id,
+                        'match_details': {
+                            'block_key': block_key,
+                            'source_systems': [system1, system2],
+                            'timestamp': datetime.utcnow().isoformat()
+                        }
+                    })
                     
-            blocks = expanded_blocks
-            
-        return [
-            (block_records, block_comparisons)
-            for block_records, block_comparisons in blocks.values()
-            if block_records and block_comparisons
-        ]
-
-    def _process_block(
-        self,
-        records: List[Dict[str, Any]],
-        comparison_records: List[Dict[str, Any]]
-    ) -> List[Tuple[Dict[str, Any], Dict[str, Any], float, Dict[str, float]]]:
-        """Process a block of records to find matches."""
-        matches = []
-        
-        # Use parallel processing if enabled
-        if self.config.parallel_processing:
-            with ThreadPoolExecutor(
-                max_workers=self.config.num_workers
-            ) as executor:
-                # Create comparison pairs
-                pairs = [
-                    (r1, r2)
-                    for r1 in records
-                    for r2 in comparison_records
-                    if r1 is not r2  # Avoid self-matches
-                ]
+            except Exception as e:
+                print(f"Warning: Failed to process record pair ({record_id1}, {record_id2}): {str(e)}")
+                continue
                 
-                # Process pairs in parallel
-                future_to_pair = {
-                    executor.submit(self.match_records, r1, r2): (r1, r2)
-                    for r1, r2 in pairs
-                }
-                
-                for future in future_to_pair:
-                    try:
-                        overall_score, field_scores = future.result()
-                        if overall_score >= self.config.min_overall_score:
-                            r1, r2 = future_to_pair[future]
-                            matches.append((r1, r2, overall_score, field_scores))
-                    except Exception as e:
-                        self.logger.error(f"Error processing pair: {e}")
-        else:
-            # Sequential processing
-            for r1 in records:
-                for r2 in comparison_records:
-                    if r1 is r2:  # Skip self-matches
-                        continue
-                        
-                    try:
-                        overall_score, field_scores = self.match_records(r1, r2)
-                        if overall_score >= self.config.min_overall_score:
-                            matches.append((r1, r2, overall_score, field_scores))
-                    except Exception as e:
-                        self.logger.error(f"Error matching records: {e}")
-                        
         return matches
-
-    def match_dataframe(
-        self,
-        df1: pd.DataFrame,
-        df2: Optional[pd.DataFrame] = None,
-        id_field: str = "id"
-    ) -> pd.DataFrame:
-        """Match records in pandas DataFrames.
-        
-        Args:
-            df1: First DataFrame
-            df2: Optional second DataFrame (if None, matches within df1)
-            id_field: Field containing record ID
-            
-        Returns:
-            DataFrame with match results
-        """
-        # Convert DataFrames to records
-        records1 = df1.to_dict("records")
-        records2 = df2.to_dict("records") if df2 is not None else None
-        
-        # Find matches
-        matches = self.find_matches(records1, records2)
-        
-        # Convert results to DataFrame
-        results = []
-        for r1, r2, score, field_scores in matches:
-            result = {
-                "id1": r1[id_field],
-                "id2": r2[id_field],
-                "overall_score": score
-            }
-            result.update({
-                f"{field}_score": field_score
-                for field, field_score in field_scores.items()
-            })
-            results.append(result)
-            
-        return pd.DataFrame(results)
