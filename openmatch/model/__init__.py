@@ -9,7 +9,8 @@ from .fields import (
     IntegerField,
     FloatField,
     BooleanField,
-    DateTimeField
+    DateTimeField,
+    JSONField
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     'IntegerField',
     'FloatField',
     'BooleanField',
-    'DateTimeField'
+    'DateTimeField',
+    'JSONField'
 ] 

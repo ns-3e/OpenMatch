@@ -11,20 +11,142 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql import text
 import json
+import psycopg2
 
 from .config import DataModelConfig
 from .manager import DataModelManager
 
 
 class EntityManager:
-    """Manages entity operations and relationships."""
+    """Manages entity operations and relationships.
     
-    def __init__(self, session: Session):
-        """Initialize entity manager with database session."""
-        self.session = session
+    This class is responsible for managing entity lifecycle operations including:
+    - Creating and updating entities
+    - Managing relationships between entities
+    - Handling entity versioning and history
+    - Cross-referencing entities across source systems
+    
+    Attributes:
+        session: SQLAlchemy session for database operations
+        model_registry: Registry of entity models
+        _cache: Cache for frequently accessed entities
+    """
+    
+    def __init__(self, target_config):
+        """Initialize entity manager.
+        
+        Args:
+            target_config: Target database configuration
+        """
+        self.target_config = target_config
+        self.model_registry = {}
+        self._cache = {}
         self.logger = logging.getLogger(__name__)
         self.data_model_manager = None
+        self.session = None
+        self._setup_session()
         
+    def _setup_session(self):
+        """Set up database session."""
+        try:
+            engine = sa.create_engine(
+                f"postgresql://{self.target_config.username}:{self.target_config.password}"
+                f"@{self.target_config.host}:{self.target_config.port}/{self.target_config.database}"
+            )
+            Session = sa.orm.sessionmaker(bind=engine)
+            self.session = Session()
+            self.logger.debug("Database session created successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to create database session: {e}")
+            raise
+        
+    def initialize(self):
+        """Initialize the MDM schema and tables."""
+        try:
+            # Create schema if not exists
+            conn = psycopg2.connect(
+                dbname=self.target_config.database,
+                user=self.target_config.user,
+                password=self.target_config.password,
+                host=self.target_config.host,
+                port=self.target_config.port
+            )
+            conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+            
+            with conn.cursor() as cur:
+                # Create schema
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.target_config.schema}")
+                
+                # Create pgvector extension if available
+                try:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    self.logger.info("Created pgvector extension")
+                except Exception as e:
+                    self.logger.warning(f"Could not create pgvector extension. Vector operations will use fallback mode: {str(e)}")
+                
+                # Create base tables
+                self._create_base_tables(cur)
+                
+            conn.close()
+            self.logger.info("Database setup completed successfully!")
+            
+        except Exception as e:
+            self.logger.error(f"Error during initialization: {str(e)}")
+            raise
+            
+    def _create_base_tables(self, cur):
+        """Create base MDM tables."""
+        try:
+            # Create UUID extension if not exists
+            cur.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"")
+            
+            # Create golden records table
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.target_config.schema}.golden_records (
+                    id UUID PRIMARY KEY,
+                    entity_type VARCHAR(50) NOT NULL,
+                    source_system VARCHAR(50) NOT NULL,
+                    source_id VARCHAR(255) NOT NULL,
+                    data JSONB NOT NULL,
+                    match_status VARCHAR(50) DEFAULT 'UNMATCHED',
+                    match_group_id UUID,
+                    match_score FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create match groups table
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.target_config.schema}.match_groups (
+                    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                    entity_type VARCHAR(50) NOT NULL,
+                    master_record_id UUID,
+                    confidence_score FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create match pairs table
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.target_config.schema}.match_pairs (
+                    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                    record_id_1 UUID REFERENCES {self.target_config.schema}.golden_records(id),
+                    record_id_2 UUID REFERENCES {self.target_config.schema}.golden_records(id),
+                    match_score FLOAT NOT NULL,
+                    match_status VARCHAR(50) DEFAULT 'PENDING',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            self.logger.info("MDM tables created successfully!")
+            
+        except Exception as e:
+            self.logger.error(f"Error creating MDM tables: {str(e)}")
+            raise
+            
     def initialize_model(self, model_config: DataModelConfig):
         """Initialize the data model with given configuration."""
         try:
@@ -175,4 +297,9 @@ class EntityManager:
             
         except Exception as e:
             self.logger.error(f"Failed to search entities: {e}")
-            raise 
+            raise
+            
+    def __del__(self):
+        """Clean up resources."""
+        if self.session:
+            self.session.close() 

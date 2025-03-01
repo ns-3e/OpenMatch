@@ -7,6 +7,7 @@ import os
 import sys
 import argparse
 import logging
+import logging.config
 import json
 from datetime import datetime
 from pathlib import Path
@@ -15,9 +16,9 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
-from match.settings import MDM_DB, VECTOR_SETTINGS, LOGGING
-from match.db_ops import DatabaseOptimizer
-from match.engine import MatchEngine
+from openmatch.match.settings import MDM_DB, VECTOR_SETTINGS, LOGGING
+from openmatch.match.db_ops import DatabaseOptimizer
+from openmatch.match.engine import MatchEngine
 from .match.settings import DatabaseConfig
 from .model.entity import EntityManager
 from .model.config import DataModelConfig

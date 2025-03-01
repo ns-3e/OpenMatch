@@ -35,35 +35,67 @@ class MemoryError(Exception):
 
 @dataclass
 class LSHVector:
-    """Locality-Sensitive Hashing vector for rapid approximate matching."""
+    """Locality-Sensitive Hashing vector for rapid approximate matching.
+    
+    This class represents a vector in LSH space used for efficient similarity
+    search and approximate nearest neighbor finding. It stores a binary signature
+    that preserves similarity relationships between records.
+    
+    Attributes:
+        signature: Binary hash signature of the record
+        record_idx: Index of the original record
+        confidence: Confidence score of the hash (default: 1.0)
+    """
     signature: bytes
     record_idx: int
     confidence: float = 1.0
     
     def __hash__(self):
+        """Get hash value of the vector.
+        
+        Returns:
+            Hash of the signature for use in hash tables
+        """
         return hash(self.signature)
     
     def __eq__(self, other):
+        """Compare vectors for equality.
+        
+        Args:
+            other: Another vector to compare with
+            
+        Returns:
+            True if other is same type and has identical signature
+        """
         return isinstance(other, LSHVector) and self.signature == other.signature
 
 class MatchEngine:
-    """Manages matching operations with relationship support."""
+    """Core engine for performing entity matching.
+    
+    This class implements the main matching logic using LSH and other algorithms
+    to efficiently find matching records. It handles blocking, comparison,
+    and match decision making.
+    
+    Attributes:
+        db_config: Database configuration
+        match_config: Matching algorithm configuration
+        embedding_model: Model used for text embeddings
+        _lsh_index: LSH index for similarity search
+        _record_cache: Cache of processed records
+    """
     
     def __init__(
         self,
-        config: MatchConfig,
-        db_config: DatabaseConfig,
+        target_config,
         force_model: Optional[str] = None
     ):
         """Initialize match engine with configuration.
         
         Args:
-            config: Match engine configuration
-            db_config: Database configuration
+            target_config: Target database configuration
             force_model: Optional model name to use, bypassing system checks
         """
-        self.config = config
-        self.db_config = db_config
+        self.target_config = target_config
         self.logger = logging.getLogger(__name__)
         
         # Check system resources and get recommended model
@@ -103,7 +135,6 @@ class MatchEngine:
             self.logger.error(f"Failed to initialize embedding model: {e}")
             raise
         
-        self.rules = [MatchRule(rule_config) for rule_config in config.rules]
         self.memory_threshold = 0.90  # 90% memory usage threshold
         self.embedding_batch_size = 128  # Increased batch size
         self.blocking_cache = {}  # Cache for blocking key values
@@ -113,7 +144,7 @@ class MatchEngine:
         self.last_memory_check = time.time()  # Initialize memory check time
         self.memory_check_interval = 5  # Check memory every 5 seconds
         self.embedding_model = None  # Initialize as None
-        self.model_id = f"{config.blocking.embedding_model}_{int(time.time())}"  # Unique model ID
+        self.model_id = f"{model_name}_{int(time.time())}"  # Unique model ID
         
         # Initialize components
         self._initialize_embedding_model()
@@ -136,34 +167,21 @@ class MatchEngine:
                 raise MemoryError(f"Memory usage ({memory_percent*100:.1f}%) exceeds threshold ({self.memory_threshold*100}%)")
         
     def _initialize_embedding_model(self):
-        """Initialize the SentenceTransformer model for embeddings."""
+        """Initialize the embedding model."""
         try:
-            # Force CPU on macOS to avoid MPS memory issues
-            import platform
-            device = "cpu" if platform.system() == "Darwin" else ("cuda" if self.config.use_gpu else "cpu")
-            
+            # Try to load primary model
             try:
-                self.embedding_model = SentenceTransformer(
-                    self.config.blocking.embedding_model,
-                    device=device
-                )
+                self.embedding_model = SentenceTransformer('Salesforce/SFR-Embedding-2_R')
+                self.logger.info("Loaded primary model: Salesforce/SFR-Embedding-2_R")
             except Exception as e:
-                print(f"Warning: Failed to load primary model: {str(e)}")
-                print("Falling back to smaller model...")
-                self.embedding_model = SentenceTransformer(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    device="cpu"  # Always use CPU for fallback model
-                )
-            
-            # Verify model loaded correctly
-            if self.embedding_model is None:
-                raise ValueError("Failed to initialize embedding model")
+                self.logger.warning(f"\n\nWarning: Failed to load primary model: 'mistral'\nFalling back to smaller model...")
+                # Fall back to smaller model
+                self.embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                self.logger.info("Loaded fallback model: sentence-transformers/all-MiniLM-L6-v2")
                 
-            # Precompute and cache embeddings for common values
-            self._precompute_common_embeddings()
         except Exception as e:
-            print(f"Critical: Could not initialize any embedding model: {str(e)}")
-            self.embedding_model = None  # Ensure it's None if initialization failed
+            self.logger.error(f"Failed to initialize embedding model: {e}")
+            raise
     
     def _precompute_common_embeddings(self):
         """Precompute and cache embeddings for common values."""
@@ -659,3 +677,36 @@ class MatchEngine:
                 continue
                 
         return matches
+
+    def get_unmatched_records(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Get unmatched records from the database.
+        
+        Args:
+            limit: Maximum number of records to return
+            
+        Returns:
+            List of unmatched records
+        """
+        try:
+            # Query to get unmatched records
+            query = f"""
+                SELECT r.*
+                FROM {self.db_config.schema}.records r
+                LEFT JOIN {self.db_config.schema}.match_results m
+                    ON r.id = m.record_id_1 OR r.id = m.record_id_2
+                WHERE m.id IS NULL
+                LIMIT %s
+            """
+            
+            with self.db_config.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (limit,))
+                    records = cur.fetchall()
+                    
+                    # Convert to list of dicts
+                    columns = [desc[0] for desc in cur.description]
+                    return [dict(zip(columns, record)) for record in records]
+                    
+        except Exception as e:
+            self.logger.error(f"Error getting unmatched records: {str(e)}")
+            return []

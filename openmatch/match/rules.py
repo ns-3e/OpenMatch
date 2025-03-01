@@ -166,6 +166,7 @@ def create_exact_ssn_rule() -> MatchRuleConfig:
     """Create a rule for exact SSN matching."""
     return MatchRuleConfig(
         name="exact_ssn",
+        rule_id="EXACT_SSN_001",
         fields=[
             FieldConfig(
                 name="ssn",
@@ -180,6 +181,7 @@ def create_fuzzy_name_dob_rule() -> MatchRuleConfig:
     """Create a rule for fuzzy name matching with DOB."""
     return MatchRuleConfig(
         name="fuzzy_name_dob",
+        rule_id="FUZZY_NAME_DOB_001",
         fields=[
             FieldConfig(
                 name="first_name",

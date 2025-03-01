@@ -1,5 +1,8 @@
 """
 Field classes for OpenMatch models.
+
+This module provides the field types used to define model attributes in OpenMatch.
+Each field type handles validation, conversion, and storage of different data types.
 """
 
 from typing import Any, Dict, Optional, Type, List, Union
@@ -10,7 +13,23 @@ import numpy as np
 
 
 class Field:
-    """Base class for model fields."""
+    """Base class for model fields.
+    
+    This class provides the foundation for all field types in OpenMatch models.
+    It handles basic field operations like initialization, value getting/setting,
+    and type conversion.
+    
+    Attributes:
+        null: Whether the field can be null
+        blank: Whether the field can be blank (empty string)
+        default: Default value for the field
+        unique: Whether the field value must be unique
+        primary_key: Whether this field is the primary key
+        help_text: Description of the field
+        verbose_name: Human-readable name for the field
+        name: Name of the field (set by model)
+        model: Model class this field belongs to
+    """
     
     def __init__(
         self,
@@ -22,6 +41,17 @@ class Field:
         help_text: str = "",
         verbose_name: str = None
     ):
+        """Initialize field with configuration options.
+        
+        Args:
+            null: Whether the field can be null
+            blank: Whether the field can be blank
+            default: Default value for the field
+            unique: Whether the field value must be unique
+            primary_key: Whether this field is the primary key
+            help_text: Description of the field
+            verbose_name: Human-readable name for the field
+        """
         self.null = null
         self.blank = blank
         self.default = default
@@ -34,40 +64,90 @@ class Field:
         self.model = None
         
     def contribute_to_class(self, cls: Type, name: str):
-        """Initialize field on model class."""
+        """Initialize field on model class.
+        
+        Args:
+            cls: Model class this field belongs to
+            name: Name of the field
+        """
         self.name = name
         self.model = cls
         setattr(cls, name, self)
         
     def __get__(self, instance, owner):
-        """Get field value from instance."""
+        """Get field value from instance.
+        
+        Args:
+            instance: Model instance
+            owner: Model class
+            
+        Returns:
+            Field value or field instance if accessed on class
+        """
         if instance is None:
             return self
         return instance.__dict__.get(self.name, self.default)
         
     def __set__(self, instance, value):
-        """Set field value on instance."""
+        """Set field value on instance.
+        
+        Args:
+            instance: Model instance
+            value: Value to set
+        """
         instance.__dict__[self.name] = self.to_python(value)
         
     def to_python(self, value: Any) -> Any:
-        """Convert value to Python type."""
+        """Convert value to Python type.
+        
+        Args:
+            value: Value to convert
+            
+        Returns:
+            Converted value
+        """
         if value is None and self.null:
             return None
         return value
         
     def get_prep_value(self, value: Any) -> Any:
-        """Prepare value for database storage."""
+        """Prepare value for database storage.
+        
+        Args:
+            value: Value to prepare
+            
+        Returns:
+            Value ready for database storage
+        """
         return value
 
 
 class CharField(Field):
-    """String field."""
+    """String field with optional maximum length.
+    
+    Attributes:
+        max_length: Maximum length of the string
+    """
     
     def __init__(self, max_length: int = None, **kwargs):
+        """Initialize CharField.
+        
+        Args:
+            max_length: Maximum length of the string
+            **kwargs: Additional field options
+        """
         super().__init__(**kwargs)
         self.max_length = max_length
         
     def to_python(self, value: Any) -> Optional[str]:
+        """Convert value to string.
+        
+        Args:
+            value: Value to convert
+            
+        Returns:
+            String value or None if null
+        """
         if value is None and self.null:
             return None
         return str(value)
@@ -83,9 +163,17 @@ class IntegerField(Field):
 
 
 class FloatField(Field):
-    """Float field."""
+    """Floating point number field."""
     
     def to_python(self, value: Any) -> Optional[float]:
+        """Convert value to float.
+        
+        Args:
+            value: Value to convert
+            
+        Returns:
+            Float value or None if null
+        """
         if value is None and self.null:
             return None
         return float(value)
@@ -95,6 +183,14 @@ class BooleanField(Field):
     """Boolean field."""
     
     def to_python(self, value: Any) -> Optional[bool]:
+        """Convert value to boolean.
+        
+        Args:
+            value: Value to convert
+            
+        Returns:
+            Boolean value or None if null
+        """
         if value is None and self.null:
             return None
         return bool(value)
@@ -125,13 +221,23 @@ class DateTimeField(Field):
 
 
 class JSONField(Field):
-    """JSON field."""
+    """JSON field with optional schema validation.
+    
+    Attributes:
+        schema: Optional JSON schema for validation
+    """
     
     def __init__(
         self,
         schema: Optional[Dict] = None,
         **kwargs
     ):
+        """Initialize JSONField.
+        
+        Args:
+            schema: Optional JSON schema for validation
+            **kwargs: Additional field options
+        """
         super().__init__(**kwargs)
         self.schema = schema
 

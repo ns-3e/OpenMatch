@@ -34,7 +34,17 @@ class DatabaseConfig:
         return f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
 
 class DatabaseConnector:
-    """Manages database connections and operations for MDM."""
+    """Manages database connections and operations for MDM.
+    
+    This class handles all database-related operations including connection management,
+    session handling, and basic database operations. It provides a unified interface
+    for interacting with the MDM database.
+    
+    Attributes:
+        config: Database configuration object containing connection details
+        engine: SQLAlchemy engine instance
+        session_factory: SQLAlchemy session factory
+    """
     
     def __init__(self, config: DatabaseConfig):
         self.config = config
@@ -87,7 +97,11 @@ class DatabaseConnector:
             session.close()
 
     def check_connection(self) -> bool:
-        """Test database connection."""
+        """Test database connection.
+        
+        Returns:
+            bool: True if connection is successful, False otherwise
+        """
         try:
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
@@ -96,6 +110,10 @@ class DatabaseConnector:
             return False
 
     def get_table_names(self) -> list:
-        """Get all tables in the MDM schema."""
+        """Get all tables in the MDM schema.
+        
+        Returns:
+            list: List of table names in the configured schema
+        """
         inspector = inspect(self.engine)
         return inspector.get_table_names(schema=self.config.schema) 

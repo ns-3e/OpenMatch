@@ -17,41 +17,53 @@ class VectorBackend(Enum):
 @dataclass
 class DatabaseConfig:
     """Database configuration."""
-    engine: str
-    host: str
-    port: int
-    name: str
-    user: str
-    password: str
-    schema: str = 'public'
-    min_connections: int = 5
-    max_connections: int = 20
-    timeout: int = 30
-    vector_backend: VectorBackend = VectorBackend.PGVECTOR
-    vector_dimension: int = 768
-    vector_index_type: str = 'ivfflat'
-    vector_lists: int = 100
-    vector_probes: int = 10
+    
+    def __init__(
+        self,
+        name: str,
+        user: str,
+        password: str,
+        host: str = 'localhost',
+        port: int = 5432,
+        schema: str = 'public',
+        vector_backend: VectorBackend = VectorBackend.PGVECTOR,
+        engine: str = 'postgresql'
+    ):
+        self.name = name
+        self.user = user
+        self.password = password
+        self.host = host
+        self.port = port
+        self.schema = schema
+        self.vector_backend = vector_backend
+        self.engine = engine
+        
+    def get_connection(self):
+        """Get a database connection."""
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        
+        return psycopg2.connect(
+            host=self.host,
+            port=self.port,
+            dbname=self.name,
+            user=self.user,
+            password=self.password,
+            cursor_factory=RealDictCursor
+        )
 
     @classmethod
     def from_dict(cls, config: Dict) -> 'DatabaseConfig':
         """Create DatabaseConfig from dictionary."""
         return cls(
-            engine=config.get('ENGINE', 'postgresql'),
-            host=config.get('HOST', 'localhost'),
-            port=config.get('PORT', 5432),
             name=config.get('NAME', 'mdm'),
             user=config.get('USER', 'postgres'),
             password=config.get('PASSWORD', ''),
+            host=config.get('HOST', 'localhost'),
+            port=config.get('PORT', 5432),
             schema=config.get('SCHEMA', 'public'),
-            min_connections=config.get('MIN_CONNECTIONS', 5),
-            max_connections=config.get('MAX_CONNECTIONS', 20),
-            timeout=config.get('TIMEOUT', 30),
             vector_backend=VectorBackend(config.get('VECTOR_BACKEND', 'pgvector')),
-            vector_dimension=config.get('VECTOR_DIMENSION', 768),
-            vector_index_type=config.get('VECTOR_INDEX_TYPE', 'ivfflat'),
-            vector_lists=config.get('VECTOR_LISTS', 100),
-            vector_probes=config.get('VECTOR_PROBES', 10)
+            engine=config.get('ENGINE', 'postgresql')
         )
 
 # Database Settings

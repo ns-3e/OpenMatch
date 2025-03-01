@@ -17,7 +17,7 @@ PGPASSWORD=$POSTGRES_PASSWORD psql -h localhost -U postgres -c "DROP DATABASE IF
 PGPASSWORD=$POSTGRES_PASSWORD psql -h localhost -U postgres -c "CREATE DATABASE openmatch_test;"
 
 # Generate and load test data using the data generator
-echo "Generating and loading 50k test records..."
+echo "Generating and loading 5M test records..."
 python3 -m openmatch.tests.generate_test_data \
     --num-records 5000000 \
     --format postgres \

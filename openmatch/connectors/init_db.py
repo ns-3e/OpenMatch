@@ -3,6 +3,9 @@ Database initialization and schema creation utilities.
 """
 import logging
 from typing import Optional
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from sqlalchemy.exc import ProgrammingError
 from .database import DatabaseConnector, DatabaseConfig
 from .schema import Base
 
@@ -31,6 +34,46 @@ def init_database(
         DatabaseConnector instance
     """
     try:
+        # First connect to PostgreSQL server to create database if needed
+        server_conn = psycopg2.connect(
+            host=host,
+            port=port,
+            user=username,
+            password=password
+        )
+        server_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        
+        with server_conn.cursor() as cur:
+            # Check if database exists
+            cur.execute(f"SELECT 1 FROM pg_database WHERE datname = '{database}'")
+            if not cur.fetchone():
+                logger.info(f"Creating database '{database}'...")
+                cur.execute(f"CREATE DATABASE {database}")
+                logger.info(f"Database '{database}' created successfully")
+        
+        server_conn.close()
+        
+        # Now connect to the MDM database
+        db_conn = psycopg2.connect(
+            host=host,
+            port=port,
+            user=username,
+            password=password,
+            database=database
+        )
+        db_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        
+        with db_conn.cursor() as cur:
+            # Create pgvector extension
+            try:
+                logger.info("Creating pgvector extension...")
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                logger.info("pgvector extension created successfully")
+            except psycopg2.Error as e:
+                logger.warning(f"Could not create pgvector extension. Vector operations will use fallback mode: {e}")
+        
+        db_conn.close()
+        
         # Create database configuration
         config = DatabaseConfig(
             host=host,
